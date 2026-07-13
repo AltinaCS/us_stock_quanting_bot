@@ -1,0 +1,12 @@
+﻿[licenses]
+# 關鍵功能：設定允許與明確拒絕的開源授權名單
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2015",
+    "Unicode-DFS-2016"
+]
+private = { ignore = true }
