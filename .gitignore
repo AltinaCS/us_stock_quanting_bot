@@ -2,3 +2,6 @@
 **/*.rs.bk
 .env
 config.toml
+DB_SCHEMA.md
+market_data.db
+TODO

@@ -35,13 +35,19 @@ pub struct Position {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 // 註解：定義Alpaca支援的訂單類型
-enum OrderType {
+pub enum OrderType {
     Market,
     Limit,
 }
 #[derive(Debug, Clone, Copy)]
+// 註解：外部呼叫使用的強型別訂單枚舉
+pub enum OrderTypeInput {
+    Market,
+    Limit(Decimal),
+}
+#[derive(Debug, Clone, Copy)]
 // 註解：定義交易計算方法（使用XOR枚舉避免同時傳入）
-enum OrderMethod {
+pub enum OrderMethod {
     Qty(Decimal),
     Notional(Decimal),
 }
@@ -62,16 +68,30 @@ pub enum Side {
     Sell,
 }
 // 關鍵功能：支援動態單類與XOR交易計算方法的通用下單函式
-// 關鍵功能：原生支援Decimal運算與自動格式化字串的通用下單函式
-async fn place_order(
+/// 關鍵功能：原生支援Decimal運算與自動格式化字串的通用下單函式
+pub async fn place_order(
     client: &reqwest::Client,
     symbol: &str,
     side: Side,
-    order_type: OrderType,
+    order_type_input: OrderTypeInput,
     mut tif: TimeInForce,
     method: OrderMethod,
+    extended_hours: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     
+    // 註解：依據輸入類型解構出API需要的類型與價格
+    let (mut order_type, limit_price) = match order_type_input {
+        OrderTypeInput::Market => (OrderType::Market, None),
+        OrderTypeInput::Limit(price) => (OrderType::Limit, Some(price)),
+    };
+
+    // 註解：若啟動盤外交易則強制修正訂單類型為限價單
+    if extended_hours {
+        if let OrderType::Market = order_type {
+            order_type = OrderType::Limit;
+        }
+    }
+
     // 1. 利用 Match 解構並依據碎股邏輯安全修正 TimeInForce
     let (method_key, method_val) = match method {
         OrderMethod::Notional(n) => {
@@ -92,9 +112,17 @@ async fn place_order(
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "time_in_force": tif
+        "time_in_force": tif,
+        "extended_hours": extended_hours
     });
     order_body[method_key] = serde_json::json!(method_val);
+
+    // 註解：若為限價單則動態寫入限價價格欄位
+    if let OrderType::Limit = order_type {
+        if let Some(price) = limit_price {
+            order_body["limit_price"] = serde_json::json!(price.to_string());
+        }
+    }
 
     let response = client
         .post(format!("{}/v2/orders", config::BASE_URL.get().unwrap()))
@@ -112,7 +140,7 @@ async fn place_order(
     
     Ok(order_id)
 }
-async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // 根據是否有ID決定URL，None就是撈取全部掛單
     let url = match order_id {
         Some(id) => format!("{}/v2/orders/{}", config::BASE_URL.get().unwrap(), id),
@@ -133,7 +161,7 @@ async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<
 }
 
 // 關鍵功能：支援取消單筆或全選取消所有掛單
-async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // None時直接對/v2/orders發射DELETE就是大清空
     let url = match order_id {
         Some(id) => format!("{}/v2/orders/{}", config::BASE_URL.get().unwrap(), id),
