@@ -5,3 +5,5 @@ config.toml
 DB_SCHEMA.md
 market_data.db
 TODO
+assets_cache.json
+localhost.session.sql

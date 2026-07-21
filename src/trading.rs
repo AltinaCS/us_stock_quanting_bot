@@ -5,6 +5,10 @@ use serde::{Serialize,Deserialize};
 use reqwest::{Client, header::{HeaderMap, HeaderValue}};
 use std::sync::OnceLock;
 use crate::config;
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+use indicatif::{ProgressBar, ProgressStyle};
 #[derive(Debug, Deserialize)]
 pub struct Account {
     // 註解：總資產淨值（持倉市值 + 現金），計算動態權重的分母
@@ -16,6 +20,18 @@ pub struct Account {
     
     // 註解：純現金餘額
     pub cash: Decimal,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlpacaAsset {
+    pub id: String,
+    pub class: String,
+    pub exchange: String,
+    pub symbol: String,
+    pub name: String,
+    pub status: String,
+    pub tradable: bool,
+    pub shortable: bool,
+    pub easy_to_borrow: bool,
 }
 #[derive(Debug, Deserialize)]
 pub struct Position {
@@ -66,6 +82,11 @@ pub enum TimeInForce {
 pub enum Side {
     Buy,
     Sell,
+}
+#[derive(Serialize, Deserialize)]
+pub struct AssetsCache {
+    pub updated_at: u64, // UNIX 時間戳記 (秒)
+    pub assets: Vec<AlpacaAsset>,
 }
 // 關鍵功能：支援動態單類與XOR交易計算方法的通用下單函式
 /// 關鍵功能：原生支援Decimal運算與自動格式化字串的通用下單函式
@@ -125,9 +146,9 @@ pub async fn place_order(
     }
 
     let response = client
-        .post(format!("{}/v2/orders", config::BASE_URL.get().unwrap()))
-        .header("APCA-API-KEY-ID", config::API_KEY.get().unwrap())
-        .header("APCA-API-SECRET-KEY", config::API_SECRET.get().unwrap())
+        .post(format!("{}/v2/orders", &*config::BASE_URL))
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
         .json(&order_body)
         .send()
         .await?;
@@ -143,14 +164,14 @@ pub async fn place_order(
 pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // 根據是否有ID決定URL，None就是撈取全部掛單
     let url = match order_id {
-        Some(id) => format!("{}/v2/orders/{}", config::BASE_URL.get().unwrap(), id),
-        None => format!("{}/v2/orders", config::BASE_URL.get().unwrap()),
+        Some(id) => format!("{}/v2/orders/{}", &*config::BASE_URL, id),
+        None => format!("{}/v2/orders", &*config::BASE_URL),
     };
 
     let response = client
         .get(&url)
-        .header("APCA-API-KEY-ID", config::API_KEY.get().unwrap())
-        .header("APCA-API-SECRET-KEY", config::API_SECRET.get().unwrap())
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY",&* config::API_SECRET)
         .send()
         .await?;
 
@@ -164,14 +185,14 @@ pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Res
 pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // None時直接對/v2/orders發射DELETE就是大清空
     let url = match order_id {
-        Some(id) => format!("{}/v2/orders/{}", config::BASE_URL.get().unwrap(), id),
-        None => format!("{}/v2/orders", config::BASE_URL.get().unwrap()),
+        Some(id) => format!("{}/v2/orders/{}", &*config::BASE_URL, id),
+        None => format!("{}/v2/orders", &*config::BASE_URL),
     };
 
     let response = client
         .delete(&url)
-        .header("APCA-API-KEY-ID", config::API_KEY.get().unwrap())
-        .header("APCA-API-SECRET-KEY", config::API_SECRET.get().unwrap())
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
         .send()
         .await?;
 
@@ -189,13 +210,13 @@ pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> 
 pub async fn get_positions(
     client: &reqwest::Client,
 ) -> Result<Vec<Position>, Box<dyn std::error::Error>> {
-    let url = format!("{}/v2/positions", config::BASE_URL.get().unwrap());
+    let url = format!("{}/v2/positions", &*config::BASE_URL);
 
     // 1. 發送 GET 請求獲取持倉列表
     let response = client
         .get(url)
-        .header("APCA-API-KEY-ID", config::API_KEY.get().unwrap())
-        .header("APCA-API-SECRET-KEY", config::API_SECRET.get().unwrap())
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
         .send()
         .await?;
 
@@ -213,15 +234,15 @@ pub async fn get_positions(
 pub async fn get_account(
     client: &reqwest::Client,
 ) -> Result<Account, Box<dyn std::error::Error>> {
-    let url = format!("{}/v2/account", config::BASE_URL.get().unwrap());
+    let url = format!("{}/v2/account", &*config::BASE_URL);
 
     let response = client
         .get(url)
-        .header("APCA-API-KEY-ID", config::API_KEY.get().unwrap())
-        .header("APCA-API-SECRET-KEY", config::API_SECRET.get().unwrap())
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
         .send()
         .await?;
-
+   
     if !response.status().is_success() {
         let err_text = response.text().await?;
         return Err(format!("獲取帳戶失敗: {}", err_text).into());
@@ -229,4 +250,76 @@ pub async fn get_account(
 
     let account: Account = response.json().await?;
     Ok(account)
+}
+pub async fn get_assets(
+    client: &reqwest::Client,
+) -> Result<Vec<AlpacaAsset>, Box<dyn std::error::Error>> {
+    let cache_path = Path::new("assets_cache.json");
+    let three_months_secs: u64 = 90 * 24 * 60 * 60; // 90 天的秒數
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs();
+
+    // 1. 檢查快取是否存在且未過期
+    if cache_path.exists() {
+        if let Ok(json_str) = fs::read_to_string(cache_path) {
+            if let Ok(cache) = serde_json::from_str::<AssetsCache>(&json_str) {
+                let age_secs = now_secs.saturating_sub(cache.updated_at);
+                
+                if age_secs < three_months_secs {
+                    let days_left = (three_months_secs - age_secs) / 86400;
+                    println!("[系統通知] 載入本地資產快取（剩餘有效期限：約 {} 天）", days_left);
+                    return Ok(cache.assets);
+                } else {
+                    println!("[系統通知] 本地資產快取已超過 3 個月（已過期），準備更新...");
+                }
+            }
+        }
+    }
+    else{
+        println!("[系統通知] 本地無快取，正在從 Alpaca API 抓取龐大資產清單...");
+    }
+
+    let url = format!("{}/v2/assets", &*config::BASE_URL);
+    // 這裡放你原本去 client.get(...) 戳 Alpaca API 的發送邏輯
+    let response = client.get(&url)
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let err_text = response.text().await?;
+        return Err(format!("獲取資產表失敗: {}", err_text).into());
+    }
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .template("{spinner:.green} {msg}")?,
+    );
+    pb.set_message("資產抓取成功！正在處理與過濾數據中...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    let assets: Vec<AlpacaAsset> = response.json().await?;
+
+    let cache_path_buf = cache_path.to_path_buf();
+    let active_assets = tokio::task::spawn_blocking(move || -> Result<Vec<AlpacaAsset>, Box<dyn std::error::Error + Send + Sync>> {
+        let active_assets: Vec<AlpacaAsset> = assets
+            .into_iter()
+            .filter(|a| a.status == "active" && a.tradable)
+            .collect();
+
+        let new_cache = AssetsCache {
+            updated_at: now_secs,
+            assets: active_assets.clone(),
+        };
+
+        let serialized = serde_json::to_string_pretty(&new_cache)?;
+        fs::write(cache_path_buf, serialized)?;
+        Ok(active_assets)
+    }).await?
+    .map_err(|e| e.to_string())?;
+
+    pb.finish_with_message("[系統通知] 資產清單已成功持久化至 assets_cache.json");
+
+    Ok(active_assets)
 }

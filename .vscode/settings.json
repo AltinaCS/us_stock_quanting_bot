@@ -1,3 +1,17 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "sqltools.connections": [
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 8964,
+            "driver": "PostgreSQL",
+            "name": "localhost",
+            "database": "quant_db",
+            "username": "postgres",
+            "connectionTimeout": 30,
+            "password": "ayachinene0721"
+        }
+    ]
 }

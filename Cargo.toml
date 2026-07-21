@@ -3,6 +3,7 @@ name = "quant_bot"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+default-run = "quant_bot"
 
 [dependencies]
 dotenvy = "0.15"
@@ -21,3 +22,6 @@ rust_decimal_macros = "1.34"
 rusqlite = { version = "0.31", features = ["bundled"] }
 rayon = "1.12.0"
 toml = "1.1.3"
+rand = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "any", "sqlite", "postgres", "chrono"] }
+indicatif = "0.17"
