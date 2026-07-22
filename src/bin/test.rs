@@ -2,7 +2,7 @@
 use chrono::{DateTime, TimeZone, Timelike, Utc, NaiveTime,Datelike};
 use quant_bot::db_storage::{MarketDatabase,AppConfig,AlpacaClient, Preprocessor};
 use chrono_tz::America::New_York;
-use quant_bot::trading::{OrderMethod, OrderTypeInput, Side, TimeInForce, get_assets, place_order};
+use quant_bot::trading::{OrderMethod, OrderTypeInput, Side, TimeInForce, place_order};
 use quant_bot::config;
 use quant_bot::db_storage;
 use rust_decimal_macros::dec;
@@ -15,9 +15,17 @@ use rand::RngExt;
 use indicatif::{ProgressBar, ProgressStyle};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = MarketDatabase::new().await?;
 
+    // 關鍵功能註解：建立 HTTP 客戶端，並呼叫含快取判斷的資產抓取邏輯
     let client = reqwest::Client::new();
-    get_assets(&client).await?;
+    let active_assets = AlpacaClient::get_assets(&client, &db).await?;
+
+    println!("[主程式] 成功取得 {} 檔可交易資產！", active_assets.len());
+    Ok(())
+/* 
+    let client = reqwest::Client::new();
+    //get_assets(&client).await?;
    
     let db = MarketDatabase::new().await?;
 
@@ -76,5 +84,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
+*/
 }

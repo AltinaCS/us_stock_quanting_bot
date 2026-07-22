@@ -6,11 +6,24 @@ use serde::{Deserialize,Serialize};
 use std::collections::{HashMap, BTreeSet};
 use sqlx::{any::AnyPoolOptions, AnyPool, Row};
 use rust_decimal::{Decimal};
+use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 pub struct IdleConfigs {
     pub trash_talks: Vec<String>,
 }
-
+#[derive(Debug, Clone, Serialize, Deserialize,sqlx::FromRow)]
+pub struct AlpacaAsset {
+    pub id: Uuid,
+    pub symbol: String,
+    pub name: Option<String>,
+    pub exchange: String,
+    #[serde(rename = "class")]
+    pub asset_class: String,
+    pub status: String,
+    pub tradable: bool,
+    pub shortable: bool,
+    pub easy_to_borrow: bool,
+}
 #[derive(Deserialize)]
 pub struct AppConfig {
     pub market: MarketConfig, // 你原本既有的欄位
@@ -72,21 +85,81 @@ impl MarketSession {
 
 #[derive(Debug, Clone)]
 pub struct KLine {
-    symbol: String,
-    timestamp: i64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: i64,
-    session: MarketSession,
+    pub asset_id: Uuid,
+    pub symbol: String,
+    pub timestamp: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: i64,
+    pub session: MarketSession,
 }
 
 pub struct AlpacaClient;
 
 impl AlpacaClient {
+    pub async fn get_assets(
+    client: &reqwest::Client,
+    db: &MarketDatabase,
+) -> Result<Vec<AlpacaAsset>, Box<dyn std::error::Error>> {
+    // 關鍵功能註解：比對最新 updated_at 秒數，計算是否已超過 90 天
+    let last_updated = db.get_latest_asset_updated_at().await?;
+    let now_secs = chrono::Utc::now().timestamp();
+    let three_months_secs = 90 * 24 * 3600;
+    println!("成功抓取上次更新日");
+    let is_expired = match last_updated {
+        Some(updated_at) => (now_secs - updated_at) >= three_months_secs,
+        None => true,
+    };
+
+    // 關鍵功能註解：未過期則直接載入 DB 資料，跳過 API 請求
+    if !is_expired {
+        let cached_assets = db.load_assets().await?;
+        if !cached_assets.is_empty() {
+            println!("[系統通知] 從資料庫載入快取的資產清單 (未滿 3 個月)");
+            return Ok(cached_assets);
+        }
+    }
+
+    // 關鍵功能註解：快取不存在或已過期，重新發起 Alpaca API 抓取
+    println!("[系統通知] 資產快取過期或不存在，發起 Alpaca API 請求...");
+    let url = format!("{}/v2/assets", &*config::BASE_URL);
+    let response = client
+        .get(&url)
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let err_text = response.text().await?;
+        return Err(format!("獲取資產表失敗: {}", err_text).into());
+    }
+
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .template("{spinner:.green} {msg}")?,
+    );
+    pb.set_message("資產抓取成功！正在處理與過濾數據中...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let assets: Vec<AlpacaAsset> = response.json().await?;
+    let active_assets: Vec<AlpacaAsset> = assets
+        .into_iter()
+        .filter(|a| a.status == "active" && a.tradable)
+        .collect();
+
+    // 關鍵功能註解：寫入或更新 DB 並呈現寫入筆數
+    let saved_count = db.save_assets(&active_assets).await?;
+    pb.finish_with_message(format!("[系統通知] 已更新並存入 {} 筆資產至資料庫", saved_count));
+
+    Ok(active_assets)
+}
     // 關鍵功能註解：向Alpaca請求K線並轉換為通用KLine結構
-    pub async fn fetch_5m_data(symbol: &str,start_iso: Option<&str>, 
+    pub async fn fetch_5m_data(asset_id: Uuid,symbol: &str,start_iso: Option<&str>, 
         end_iso: Option<&str>) -> Result<Vec<KLine>, Box<dyn std::error::Error>> {
         let now = Utc::now();
 
@@ -155,6 +228,7 @@ impl AlpacaClient {
         for b in parsed.bars {
         let ts = b.timestamp.timestamp();
         klines.push(KLine {
+            asset_id: asset_id,
             symbol: symbol.to_string(),
             timestamp: ts,
             open: b.open,
@@ -178,11 +252,7 @@ impl AlpacaClient {
     // 關鍵功能註解：第二層過濾，可限制在美股盤前至盤後交易時段內才放行 (UTC時間對齊)
     // 這裡可以依據你的策略需求（是否跑盤前外盤）動態調整小時區間
     let hour = now.hour();
-    if hour >= 8 && hour <= 22 {
-        return true;
-    }
-    
-    false
+    hour >= 8 && hour <= 22
 }
 }
 
@@ -197,7 +267,7 @@ impl Preprocessor {
 
             let pre_market_start = NaiveTime::from_hms_opt(4, 0, 0).unwrap();//盤前開盤
             let regular_start = NaiveTime::from_hms_opt(9, 30, 0).unwrap(); //常規盤開盤 (盤前收盤)
-            let regular_end = NaiveTime::from_hms_opt(16, 00, 0).unwrap(); //常規盤收盤 (盤前開盤)
+            let regular_end = NaiveTime::from_hms_opt(16, 0, 0).unwrap(); //常規盤收盤 (盤前開盤)
             let post_market_end = NaiveTime::from_hms_opt(20, 0, 0).unwrap(); //盤後收盤 
 
             if current_time >= pre_market_start && current_time < regular_start {
@@ -224,23 +294,24 @@ impl Preprocessor {
 
     // 關鍵功能註解：非同步對齊多檔標的時間軸並向前填充缺口
     pub async fn process_and_align(
-        raw_portfolio: HashMap<String, Vec<KLine>>
-    ) -> Result<(Vec<i64>, HashMap<String, Vec<KLine>>), String> {
+        raw_portfolio: HashMap<Uuid, Vec<KLine>>
+    ) -> Result<(Vec<i64>, HashMap<Uuid, Vec<KLine>>), String> {
         let mut cleaned_portfolio = HashMap::new();
         let mut all_timestamps = BTreeSet::new();
 
-        for (symbol, klines) in raw_portfolio {
+        for (asset_id, klines) in raw_portfolio {
             let cleaned = Self::clean_raw_klines(klines);
             for k in &cleaned {
                 all_timestamps.insert(k.timestamp);
             }
-            cleaned_portfolio.insert(symbol, cleaned);
+            cleaned_portfolio.insert(asset_id, cleaned);
         }
 
         let union_timeline: Vec<i64> = all_timestamps.into_iter().collect();
         let mut aligned_portfolio = HashMap::new();
 
-        for (symbol, klines) in cleaned_portfolio {
+        for (asset_id, klines) in cleaned_portfolio {
+            let sample_symbol = klines.first().map(|k| k.symbol.clone()).unwrap_or_default();
             let mut kline_map: HashMap<i64, KLine> = klines.into_iter().map(|k| (k.timestamp, k)).collect();
             let mut aligned_klines = Vec::new();
             let mut last_valid: Option<KLine> = None;
@@ -257,14 +328,15 @@ impl Preprocessor {
                     aligned_klines.push(filled);
                 } else {
                     aligned_klines.push(KLine {
-                        symbol: symbol.clone(),
+                        asset_id:asset_id,
+                        symbol: sample_symbol.clone(),
                         timestamp: ts,
                         open: 0.0, high: 0.0, low: 0.0, close: 0.0, volume: 0,
                         session: Self::determine_session(ts),
                     });
                 }
             }
-            aligned_portfolio.insert(symbol, aligned_klines);
+            aligned_portfolio.insert(asset_id, aligned_klines);
         }
 
         Ok((union_timeline, aligned_portfolio))
@@ -290,6 +362,7 @@ pub enum TargetStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioTarget {
+    pub asset_id: Uuid,
     pub symbol: String,
     pub weight: Decimal, // 嚴格使用 Decimal 進行精確運算
     pub target_type: TargetType,
@@ -310,45 +383,66 @@ impl MarketDatabase {
             .max_connections(5)
             .connect(db_url)
             .await?;
+        /*
+        ACTIVE：投資組合中有在追蹤的標的
+        BLACKLISTED：投資組合中沒在被追蹤的標的
+        +++++++
+        TRADE：有在做交易的標的
+        INDICATOR：參考指標(如：VIX)
+        CASH：目前持有的現金
+         */
         sqlx::query(
         "DO $$ BEGIN
-            CREATE TYPE target_type_enum AS ENUM ('TRADE', 'INDICATOR', 'CASH');
+            CREATE TYPE target_type_enum AS ENUM ('TRADE', 'INDICATOR', 'CASH'); 
             CREATE TYPE target_status_enum AS ENUM ('ACTIVE', 'BLACKLISTED');
         EXCEPTION
             WHEN duplicate_object THEN null;
-        END $$;"
+        END $$;",
         ).execute(&pool).await?;
         // 1. 資產字典表 (必須先建立，因為 klines 與 portfolio_targets 都依賴它)
         sqlx::query(
-        "CREATE TABLE IF NOT EXISTS assets (
-            symbol VARCHAR(30) PRIMARY KEY,
-            name TEXT,
-            exchange VARCHAR(20),
-            asset_class VARCHAR(20),
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            updated_at BIGINT NOT NULL
-        );"
+                    "CREATE TABLE IF NOT EXISTS assets (
+                id UUID PRIMARY KEY,                 -- Alpaca 原生 UUID 主鍵
+                symbol VARCHAR(30) UNIQUE NOT NULL,  -- 股票代號（唯一且快速查詢）
+                name TEXT,
+                exchange VARCHAR(20) NOT NULL,
+                asset_class VARCHAR(20) NOT NULL,   -- 對應 class
+                status VARCHAR(20) NOT NULL,
+                tradable BOOLEAN NOT NULL DEFAULT TRUE,
+                shortable BOOLEAN NOT NULL DEFAULT FALSE,
+                easy_to_borrow BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at BIGINT NOT NULL
+            );",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::raw_sql(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_assets_symbol ON assets (symbol);
+            CREATE INDEX IF NOT EXISTS idx_assets_tradable_active ON assets (is_active, tradable);
+            "#,
         )
         .execute(&pool)
         .await?;
         sqlx::query(
         "CREATE TABLE IF NOT EXISTS klines (
-            symbol VARCHAR(30) NOT NULL,
+            asset_id UUID NOT NULL,
             timestamp BIGINT NOT NULL,
-            open NUMERIC NOT NULL,
-            high NUMERIC NOT NULL,
-            low NUMERIC NOT NULL,
-            close NUMERIC NOT NULL,
+            open NUMERIC(20,4) NOT NULL,
+            high NUMERIC(20,4) NOT NULL,
+            low NUMERIC(20,4) NOT NULL,
+            close NUMERIC(20,4) NOT NULL,
             volume BIGINT NOT NULL,
             session INT NOT NULL,
-            PRIMARY KEY (symbol, timestamp),
-            CONSTRAINT fk_klines_asset FOREIGN KEY (symbol) REFERENCES assets(symbol) ON DELETE RESTRICT ON UPDATE CASCADE
+            PRIMARY KEY (asset_id, timestamp),
+            CONSTRAINT fk_klines_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
         );"
         ).execute(&pool).await?;
 
         // 關鍵功能註解：建立 K 線查詢索引提升 Symbol 時間範圍檢索效能
         sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_klines_symbol_time ON klines(symbol, timestamp DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_klines_asset_time ON klines(asset_id, timestamp DESC);"
         )
         .execute(&pool)
         .await?;
@@ -358,31 +452,49 @@ impl MarketDatabase {
         // 3. 投資組合選股與權重表 (關鍵功能註解：紀錄目前入選標的與目標權重)
         sqlx::query(
         "CREATE TABLE IF NOT EXISTS portfolio_targets (
-            symbol VARCHAR(30) PRIMARY KEY,
+            asset_id UUID PRIMARY KEY,
+            symbol VARCHAR(30) NOT NULL,
             weight NUMERIC NOT NULL,
             target_type target_type_enum NOT NULL,
             selected_at BIGINT NOT NULL,
             status target_status_enum NOT NULL,
-            CONSTRAINT fk_portfolio_asset FOREIGN KEY (symbol) REFERENCES assets(symbol) ON DELETE RESTRICT ON UPDATE CASCADE
+            CONSTRAINT fk_portfolio_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
         );"
         ).execute(&pool).await?;
+            sqlx::query(
+            "CREATE TABLE IF NOT EXISTS positions (
+                asset_id UUID PRIMARY KEY,
+                symbol VARCHAR(30) NOT NULL,
+                qty NUMERIC(18,9) NOT NULL,
+                avg_entry_price NUMERIC(20,4) NOT NULL,
+                current_price NUMERIC(20,4) NOT NULL,
+                unrealized_pnl NUMERIC(20,4) NOT NULL,
+                intraday_pnl NUMERIC(20,4) NOT NULL,
+                updated_at BIGINT NOT NULL,
+                CONSTRAINT fk_positions_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
+            );"
+        )
+        .execute(&pool)
+        .await?;
 
         Ok(Self { pool })
     }
 
     // 關鍵功能註解：非同步寫入K線數據至本地資料庫
-   pub async fn save_klines(&self, symbol: String, klines: Vec<KLine>) -> Result<usize, String> {
+   pub async fn save_klines(&self, klines: Vec<KLine>) -> Result<usize, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
         let mut inserted = 0;
 
         for k in klines {
+            let asset_id_str = k.asset_id.to_string();
+            
             let res = sqlx::query(
-                "INSERT INTO klines (symbol, timestamp, open, high, low, close, volume, session) 
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT(symbol, timestamp) DO UPDATE SET
+                "INSERT INTO klines (asset_id, timestamp, open, high, low, close, volume, session) 
+                 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(asset_id, timestamp) DO UPDATE SET
                  open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close, volume=excluded.volume"
             )
-            .bind(&symbol)
+            .bind(asset_id_str)
             .bind(k.timestamp)
             .bind(k.open)
             .bind(k.high)
@@ -402,14 +514,21 @@ impl MarketDatabase {
     }
 
     // 關鍵功能註解：非同步查詢對齊特定時間區間的K線數據
-    pub async fn query_klines_by_range(&self, symbol: String, start: i64, end: i64) -> Result<Vec<KLine>, String> {
+    pub async fn query_klines_by_range(
+        &self,
+        asset_id: Uuid,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<KLine>, String> {
+        let asset_id_str = asset_id.to_string();
         let rows = sqlx::query(
-            "SELECT symbol, timestamp, open, high, low, close, volume, session 
-             FROM klines 
-             WHERE symbol = $1 AND timestamp >= $2 AND timestamp <= $3
-             ORDER BY timestamp ASC"
+            "SELECT k.asset_id::uuid, a.symbol, k.timestamp, k.open, k.high, k.low, k.close, k.volume, k.session 
+             FROM klines k
+             JOIN assets a ON k.asset_id = a.id
+             WHERE k.asset_id = $1 AND k.timestamp >= $2 AND k.timestamp <= $3
+             ORDER BY k.timestamp ASC"
         )
-        .bind(&symbol)
+        .bind(asset_id_str)
         .bind(start)
         .bind(end)
         .fetch_all(&self.pool)
@@ -419,14 +538,15 @@ impl MarketDatabase {
         let mut result = Vec::new();
         for row in rows {
             result.push(KLine {
-                symbol: row.get(0),
-                timestamp: row.get(1),
-                open: row.get(2),
-                high: row.get(3),
-                low: row.get(4),
-                close: row.get(5),
-                volume: row.get(6),
-                session: MarketSession::from_int(row.get(7)),
+                asset_id: row.get::<String, _>(0).parse().map_err(|e: uuid::Error| e.to_string())?,
+                symbol: row.get(1),
+                timestamp: row.get(2),
+                open: row.get(3),
+                high: row.get(4),
+                low: row.get(5),
+                close: row.get(6),
+                volume: row.get(7),
+                session: MarketSession::from_int(row.get(8)),
             });
         }
 
@@ -434,35 +554,45 @@ impl MarketDatabase {
     }
 
     // 關鍵功能註解：列出資料庫中所有K線資料並印出狀態
-    pub async fn list_all_klines(&self, limit_per_symbol: Option<usize>) -> Result<(), String> {
-        let limit = limit_per_symbol.unwrap_or(1000) as i64;
+    pub async fn list_all_klines(&self, limit_per_asset: Option<usize>) -> Result<(), String> {
+        let limit = limit_per_asset.unwrap_or(1000) as i64;
 
-        let symbols_rows = sqlx::query("SELECT DISTINCT symbol FROM klines ORDER BY symbol ASC")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        let assets_rows = sqlx::query(
+            "SELECT DISTINCT k.asset_id, a.symbol 
+             FROM klines k 
+             JOIN assets a ON k.asset_id = a.id 
+             ORDER BY a.symbol ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
-        for sym_row in symbols_rows {
-            let symbol: String = sym_row.get(0);
+        for a_row in assets_rows {
+            let asset_id_str: String = a_row.get(0);
+            let asset_id: Uuid = asset_id_str.parse::<uuid::Uuid>().map_err(|e: uuid::Error| e.to_string())?;
+            let symbol: String = a_row.get(1);
 
-            let count_row = sqlx::query("SELECT COUNT(*) FROM klines WHERE symbol = $1")
-                .bind(&symbol)
+            let count_row = sqlx::query("SELECT COUNT(*) FROM klines WHERE asset_id = $1")
+                .bind(&asset_id_str)
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
             let count: i64 = count_row.get(0);
 
-            println!("=== 標的: {} (資料庫內總計 {} 筆) ===", symbol, count);
+            println!(
+                "=== 標的: {} ({}) (資料庫內總計 {} 筆) ===",
+                symbol, asset_id, count
+            );
 
             let detail_rows = sqlx::query(
                 "SELECT timestamp, open, high, low, close, volume, session
                  FROM klines 
-                 WHERE symbol = $1 
+                 WHERE asset_id = $1::uuid 
                  ORDER BY timestamp DESC 
-                 LIMIT $2"
+                 LIMIT $2",
             )
-            .bind(&symbol)
+            .bind(&asset_id_str)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
@@ -477,7 +607,8 @@ impl MarketDatabase {
                 let v: i64 = row.get(5);
                 let s_val: i32 = row.get(6);
 
-                let datetime = Utc.timestamp_opt(ts, 0)
+                let datetime = Utc
+                    .timestamp_opt(ts, 0)
                     .single()
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "Invalid Date".to_string());
@@ -498,4 +629,149 @@ impl MarketDatabase {
 
         Ok(())
     }
+    pub async fn get_latest_asset_updated_at(&self) -> Result<Option<i64>, String> {
+        let row = sqlx::query("SELECT updated_at FROM assets ORDER BY updated_at DESC LIMIT 1")
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(row.map(|r| r.get("updated_at")))
+    }
+
+    // 關鍵功能註解：從資料庫撈取所有現存的資產資料
+        pub async fn load_assets(&self) -> Result<Vec<AlpacaAsset>, String> {
+        // 關鍵功能註解：手動從 AnyRow 解構欄位並轉型，解決 Uuid 與 sqlx::Any 的 Decode 衝突
+        let rows = sqlx::query("SELECT id::text, symbol, name, exchange, asset_class, status, tradable, shortable, easy_to_borrow FROM assets")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut assets = Vec::new();
+        for row in rows {
+            let id_str: String = row.get("id");
+            let id = uuid::Uuid::parse_str(&id_str).map_err(|e| e.to_string())?;
+
+            assets.push(AlpacaAsset {
+                id,
+                symbol: row.get("symbol"),
+                name: row.get("name"),
+                exchange: row.get("exchange"),
+                asset_class: row.get("asset_class"),
+                status: row.get("status"),
+                tradable: row.get("tradable"),
+                shortable: row.get("shortable"),
+                easy_to_borrow: row.get("easy_to_borrow"),
+            });
+        }
+
+        Ok(assets)
+    }
+    pub async fn save_assets(&self, assets: &[AlpacaAsset]) -> Result<usize, String> {
+    if assets.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+    let now_secs = chrono::Utc::now().timestamp();
+    let mut total_affected = 0;
+
+    // 關鍵功能註解：每 500 筆切成一個批次，大幅減少與資料庫的往返次數
+    for chunk in assets.chunks(500) {
+        let mut query_builder = String::from(
+            "INSERT INTO assets (id, symbol, name, exchange, asset_class, status, tradable, shortable, easy_to_borrow, is_active, updated_at) VALUES "
+        );
+
+        let mut query_params: Vec<String> = Vec::new();
+
+        for (i, _) in chunk.iter().enumerate() {
+            let offset = i * 11;
+            query_params.push(format!(
+                "(${}::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                offset + 1,  offset + 2,  offset + 3,  offset + 4,
+                offset + 5,  offset + 6,  offset + 7,  offset + 8,
+                offset + 9,  offset + 10, offset + 11
+            ));
+        }
+
+        query_builder.push_str(&query_params.join(", "));
+        query_builder.push_str(
+            " ON CONFLICT(id) DO UPDATE SET
+             symbol=excluded.symbol, name=excluded.name, exchange=excluded.exchange,
+             asset_class=excluded.asset_class, status=excluded.status, tradable=excluded.tradable,
+             shortable=excluded.shortable, easy_to_borrow=excluded.easy_to_borrow,
+             is_active=excluded.is_active, updated_at=excluded.updated_at"
+        );
+
+        let mut query = sqlx::query(&query_builder);
+
+        for a in chunk {
+            query = query
+                .bind(a.id.to_string())
+                .bind(&a.symbol)
+                .bind(&a.name)
+                .bind(&a.exchange)
+                .bind(&a.asset_class)
+                .bind(&a.status)
+                .bind(a.tradable)
+                .bind(a.shortable)
+                .bind(a.easy_to_borrow)
+                .bind(true)
+                .bind(now_secs);
+        }
+
+        let res = query.execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        total_affected += res.rows_affected() as usize;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(total_affected)
+}
+    pub async fn save_portfolio_targets(                                                                                                                       
+            &self,                                                                                                                                                 
+            targets: &[PortfolioTarget],                                                                                                                           
+        ) -> Result<usize, String> {                                                                                                                               
+            let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;                                                                                      
+            let mut count = 0;                                                                                                                                     
+                                                                                                                                                                   
+            for target in targets {                                                                                                                                
+                let asset_id_str = target.asset_id.to_string();                                                                                                    
+                let weight_str = target.weight.to_string();                                                                                                        
+                                                                                                                                                                   
+                let target_type_str = match target.target_type {                                                                                                   
+                    TargetType::Trade => "TRADE",                                                                                                                  
+                    TargetType::Indicator => "INDICATOR",                                                                                                          
+                    TargetType::Cash => "CASH",                                                                                                                    
+                };                                                                                                                                                 
+                                                                                                                                                                   
+                let status_str = match target.status {                                                                                                             
+                    TargetStatus::Active => "ACTIVE",                                                                                                              
+                    TargetStatus::Blacklisted => "BLACKLISTED",                                                                                                    
+                };                                                                                                                                                 
+                                                                                                                                                                   
+                sqlx::query(                                                                                                                                       
+                    "INSERT INTO portfolio_targets (asset_id, symbol, weight, target_type, selected_at, status)                                                    
+                     VALUES ($1::uuid, $2, $3::numeric, $4::target_type_enum, $5, $6::target_status_enum)                                                          
+                     ON CONFLICT(asset_id) DO UPDATE SET                                                                                                           
+                     symbol=excluded.symbol,                                                                                                                       
+                     weight=excluded.weight,                                                                                                                       
+                     target_type=excluded.target_type,                                                                                                             
+                     selected_at=excluded.selected_at,                                                                                                             
+                     status=excluded.status"                                                                                                                       
+                )                                                                                                                                                  
+                .bind(asset_id_str)                                                                                                                                
+                .bind(&target.symbol)                                                                                                                              
+                .bind(weight_str)                                                                                                                                  
+                .bind(target_type_str)                                                                                                                             
+                .bind(target.selected_at)                                                                                                                          
+                .bind(status_str)                                                                                                                                  
+                .execute(&mut *tx)                                                                                                                                 
+                .await                                                                                                                                             
+                .map_err(|e| e.to_string())?;                                                                                                                      
+                                                                                                                                                                   
+                count += 1;                                                                                                                                        
+            }                                                                                                                                                      
+                                                                                                                                                                   
+            tx.commit().await.map_err(|e| e.to_string())?;                                                                                                         
+            Ok(count)                                                                                                                                              
+        }
 }

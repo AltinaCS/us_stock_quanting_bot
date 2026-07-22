@@ -3,3 +3,4 @@ pub mod trading;
 pub mod db_storage;
 pub mod portfolio;
 pub mod backtest;
+pub mod selector;
