@@ -3,7 +3,7 @@
 use chrono_tz::America::New_York;
 use crate::config;
 use serde::{Deserialize,Serialize};
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{HashMap, BTreeSet,HashSet};
 use sqlx::{any::AnyPoolOptions, AnyPool, Row};
 use rust_decimal::{Decimal};
 use uuid::Uuid;
@@ -131,7 +131,7 @@ impl AlpacaClient {
         .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
         .send()
         .await?;
-
+    
     if !response.status().is_success() {
         let err_text = response.text().await?;
         return Err(format!("獲取資產表失敗: {}", err_text).into());
@@ -159,7 +159,7 @@ impl AlpacaClient {
     Ok(active_assets)
 }
     // 關鍵功能註解：向Alpaca請求K線並轉換為通用KLine結構
-    pub async fn fetch_5m_data(asset_id: Uuid,symbol: &str,start_iso: Option<&str>, 
+    pub async fn fetch_5m_data(client: &reqwest::Client,asset_id: Uuid,symbol: &str,start_iso: Option<&str>, 
         end_iso: Option<&str>) -> Result<Vec<KLine>, Box<dyn std::error::Error>> {
         let now = Utc::now();
 
@@ -206,7 +206,7 @@ impl AlpacaClient {
             "https://data.alpaca.markets/v2/stocks/{}/bars?timeframe=5Min&start={}&end={}&limit=10000&feed=iex&sort=asc",
             symbol, start_str, end_str
         );
-        let client = reqwest::Client::new();
+        
         let response = client.get(&url)
             .header("APCA-API-KEY-ID", &*config::API_KEY)
             .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
@@ -461,7 +461,7 @@ impl MarketDatabase {
             CONSTRAINT fk_portfolio_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
         );"
         ).execute(&pool).await?;
-            sqlx::query(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS positions (
                 asset_id UUID PRIMARY KEY,
                 symbol VARCHAR(30) NOT NULL,
@@ -476,10 +476,140 @@ impl MarketDatabase {
         )
         .execute(&pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sp500_constituents (                                                                                                                
+                asset_id UUID PRIMARY KEY,                                                                                                                                 
+                symbol VARCHAR(30) NOT NULL,                                                                                                                               
+                updated_at BIGINT NOT NULL,                                                                                                                                
+                CONSTRAINT fk_sp500_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE                                                
+            );"
+        )
+        .execute(&pool)
+        .await?;
+    
 
         Ok(Self { pool })
     }
-
+    //TODO:還沒找資料源
+     pub async fn fetch_sp500_symbols(client: &reqwest::Client) -> Result<Vec<String>, Box<dyn std::error::Error>> {                                                            
+        let url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv";                                                               
+        let resp = client.get(url).send().await?.text().await?;                                                                                                                
+        let mut symbols = Vec::new();                                                                                                                                          
+        for (i, line) in resp.lines().enumerate() {                                                                                                                            
+            if i == 0 { continue; }                                                                                                                                            
+            if let Some(symbol) = line.split(',').next() {                                                                                                                     
+                let trimmed = symbol.trim().replace('"', "");                                                                                                                  
+                if !trimmed.is_empty() {                                                                                                                                       
+                    symbols.push(trimmed);                                                                                                                                     
+                }                                                                                                                                                              
+            }                                                                                                                                                                  
+        }                                                                                                                                                                      
+        Ok(symbols)                                                                                                                                                            
+    }
+    pub async fn sync_sp500_constituents(                                                                                                                                  
+            &self,                                                                                                                                                             
+            raw_symbols: &[String],                                                                                                                                            
+        ) -> Result<(), Box<dyn std::error::Error>> {                                                                                                                          
+            let now = chrono::Utc::now().timestamp();                                                                                                                          
+                                                                                                                                                                               
+            // 1. 符號規範化：產生原始符號與連字號轉置符號                                                                                                                     
+            let mut normalized_symbols: HashSet<String> = HashSet::new();                                                                                                      
+            for s in raw_symbols {                                                                                                                                             
+                let symbol_upper = s.trim().to_uppercase();                                                                                                                    
+                normalized_symbols.insert(symbol_upper.clone());                                                                                                               
+                normalized_symbols.insert(symbol_upper.replace('.', "-"));                                                                                                     
+                normalized_symbols.insert(symbol_upper.replace('-', "."));                                                                                                     
+            }                                                                                                                                                                  
+                                                                                                                                                                               
+            let symbol_vec: Vec<String> = normalized_symbols.into_iter().collect();                                                                                            
+                                                                                                                                                                               
+            if symbol_vec.is_empty() {                                                                                                                                         
+                return Ok(());                                                                                                                                                 
+            }                                                                                                                                                                  
+                                                                                                                                                                               
+            let placeholders = symbol_vec                                                                                                                                      
+                .iter()                                                                                                                                                        
+                .enumerate()                                                                                                                                                   
+                .map(|(i, _)| format!("${}", i + 2))                                                                                                                           
+                .collect::<Vec<_>>()                                                                                                                                           
+                .join(",");                                                                                                                                                    
+                                                                                                                                                                               
+            let sql = format!(                                                                                                                                                 
+                r#"                                                                                                                                                            
+                INSERT INTO sp500_constituents (asset_id, symbol, updated_at)                                                                                                  
+                SELECT id, symbol, $1                                                                                                                                          
+                FROM assets                                                                                                                                                    
+                WHERE symbol IN ({})                                                                                                                                           
+                ON CONFLICT (asset_id)                                                                                                                                         
+                DO UPDATE SET updated_at = EXCLUDED.updated_at                                                                                                                 
+                "#,                                                                                                                                                            
+                placeholders                                                                                                                                                   
+            );                                                                                                                                                                 
+                                                                                                                                                                               
+            // 關鍵功能註解：動態構建占位符適配AnyPool資料庫                                                                                                                   
+            let mut query = sqlx::query(&sql).bind(now);                                                                                                                       
+            for s in &symbol_vec {                                                                                                                                             
+                query = query.bind(s);                                                                                                                                         
+            }                                                                                                                                                                  
+                                                                                                                                                                               
+            let rows_affected = query.execute(&self.pool).await?.rows_affected();                                                                                              
+            println!("[S&P500 同步] 成功對齊並更新 {} 檔成分股至資料庫", rows_affected);                                                                                       
+                                                                                                                                                                               
+            // 關鍵功能註解：讀取資料庫對齊標的並進行防呆比對                                                                                                                  
+            let matched_rows = sqlx::query("SELECT symbol FROM sp500_constituents")                                                                                            
+                .fetch_all(&self.pool)                                                                                                                                         
+                .await?;                                                                                                                                                       
+                                                                                                                                                                               
+            let matched_symbols: Vec<String> = matched_rows.iter().map(|r| r.get(0)).collect();                                                                                
+            let matched_set: HashSet<String> = matched_symbols.into_iter().collect();                                                                                          
+                                                                                                                                                                               
+            let missing: Vec<&String> = raw_symbols                                                                                                                            
+                .iter()                                                                                                                                                        
+                .filter(|s| {                                                                                                                                                  
+                    let u = s.to_uppercase();                                                                                                                                  
+                    let alt1 = u.replace('.', "-");                                                                                                                            
+                    let alt2 = u.replace('-', ".");                                                                                                                            
+                    !matched_set.contains(&u) && !matched_set.contains(&alt1) && !matched_set.contains(&alt2)                                                                  
+                })                                                                                                                                                             
+                .collect();                                                                                                                                                    
+                                                                                                                                                                               
+            if !missing.is_empty() {                                                                                                                                           
+                println!("[S&P500 告警] 共有 {} 檔標的未在 assets 主檔中對齊: {:?}", missing.len(), missing);                                                                  
+            }                                                                                                                                                                  
+                                                                                                                                                                               
+            Ok(())                                                                                                                                                             
+        }
+        pub async fn load_sp500_assets(&self) -> Result<Vec<AlpacaAsset>, String> {                                                                                            
+            let sql = r#"                                                                                                                                                      
+                SELECT a.id::text, a.symbol, a.name, a.exchange, a.asset_class, a.status, a.tradable, a.shortable, a.easy_to_borrow                                            
+                FROM assets a                                                                                                                                                  
+                INNER JOIN sp500_constituents s ON a.id = s.asset_id                                                                                                           
+            "#;                                                                                                                                                                
+            let rows = sqlx::query(sql)                                                                                                                                        
+                .fetch_all(&self.pool)                                                                                                                                         
+                .await                                                                                                                                                         
+                .map_err(|e| e.to_string())?;                                                                                                                                  
+                                                                                                                                                                               
+            let mut assets = Vec::new();                                                                                                                                       
+            for row in rows {                                                                                                                                                  
+                let id_str: String = row.get("id");                                                                                                                            
+                let id = uuid::Uuid::parse_str(&id_str).map_err(|e| e.to_string())?;                                                                                           
+                                                                                                                                                                               
+                assets.push(AlpacaAsset {                                                                                                                                      
+                    id,                                                                                                                                                        
+                    symbol: row.get("symbol"),                                                                                                                                 
+                    name: row.get("name"),                                                                                                                                     
+                    exchange: row.get("exchange"),                                                                                                                             
+                    asset_class: row.get("asset_class"),                                                                                                                       
+                    status: row.get("status"),                                                                                                                                 
+                    tradable: row.get("tradable"),                                                                                                                             
+                    shortable: row.get("shortable"),                                                                                                                           
+                    easy_to_borrow: row.get("easy_to_borrow"),                                                                                                                 
+                });                                                                                                                                                            
+            }                                                                                                                                                                  
+                                                                                                                                                                               
+            Ok(assets)                                                                                                                                                         
+        }  
     // 關鍵功能註解：非同步寫入K線數據至本地資料庫
    pub async fn save_klines(&self, klines: Vec<KLine>) -> Result<usize, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
@@ -629,6 +759,49 @@ impl MarketDatabase {
 
         Ok(())
     }
+    pub async fn load_portfolio_targets(&self) -> Result<Vec<PortfolioTarget>, String> {                                                                      
+            let sql = r#"                                                                                                                                         
+                SELECT asset_id::text, symbol, weight::text, target_type::text, selected_at, status::text                                                         
+                FROM portfolio_targets                                                                                                                            
+            "#;                                                                                                                                                   
+            let rows = sqlx::query(sql)                                                                                                                           
+                .fetch_all(&self.pool)                                                                                                                            
+                .await                                                                                                                                            
+                .map_err(|e| e.to_string())?;                                                                                                                     
+                                                                                                                                                                  
+            let mut targets = Vec::new();                                                                                                                         
+            for row in rows {                                                                                                                                     
+                let id_str: String = row.get("asset_id");                                                                                                         
+                let asset_id = uuid::Uuid::parse_str(&id_str).map_err(|e| e.to_string())?;                                                                        
+                let weight_str: String = row.get("weight");                                                                                                       
+                let weight = weight_str.parse::<rust_decimal::Decimal>().map_err(|e| e.to_string())?;                                                             
+                let target_type_str: String = row.get("target_type");                                                                                             
+                let target_type = match target_type_str.as_str() {                                                                                                
+                    "TRADE" => TargetType::Trade,                                                                                                                 
+                    "INDICATOR" => TargetType::Indicator,                                                                                                         
+                    "CASH" => TargetType::Cash,                                                                                                                   
+                    _ => TargetType::Trade,                                                                                                                       
+                };                                                                                                                                                
+                let status_str: String = row.get("status");                                                                                                       
+                let status = match status_str.as_str() {                                                                                                          
+                    "ACTIVE" => TargetStatus::Active,                                                                                                             
+                    "BLACKLISTED" => TargetStatus::Blacklisted,                                                                                                   
+                    _ => TargetStatus::Active,                                                                                                                    
+                };                                                                                                                                                
+                let selected_at: i64 = row.get("selected_at");                                                                                                    
+                                                                                                                                                                  
+                targets.push(PortfolioTarget {                                                                                                                    
+                    asset_id,                                                                                                                                     
+                    symbol: row.get("symbol"),                                                                                                                    
+                    weight,                                                                                                                                       
+                    target_type,                                                                                                                                  
+                    selected_at,                                                                                                                                  
+                    status,                                                                                                                                       
+                });                                                                                                                                               
+            }                                                                                                                                                     
+                                                                                                                                                                  
+            Ok(targets)                                                                                                                                           
+        }
     pub async fn get_latest_asset_updated_at(&self) -> Result<Option<i64>, String> {
         let row = sqlx::query("SELECT updated_at FROM assets ORDER BY updated_at DESC LIMIT 1")
         .fetch_optional(&self.pool)

@@ -3,8 +3,9 @@ use chrono::{DateTime, TimeZone, Timelike, Utc, NaiveTime,Datelike};
 use quant_bot::db_storage::{MarketDatabase,AppConfig,AlpacaClient, Preprocessor};
 use chrono_tz::America::New_York;
 use quant_bot::trading::{OrderMethod, OrderTypeInput, Side, TimeInForce, place_order};
-use quant_bot::config;
+use quant_bot::{config, selector};
 use quant_bot::db_storage;
+use quant_bot::selector::{SelectionMode, SelectionPipeline};
 use rust_decimal_macros::dec;
 use rand::prelude::IndexedRandom;
 use serde::Deserialize;
@@ -16,13 +17,24 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = MarketDatabase::new().await?;
+    let client =reqwest::Client::new();
+    // 關鍵功能註解：線上抓取S&P500成分股並同步至資料庫       
+    /*                                                                                                             
+        println!("[主程式] 開始線上抓取 S&P 500 成分股...");                                                                                                                   
+        let sp500_symbols = MarketDatabase::fetch_sp500_symbols(&client).await?;                                                                                                               
+        println!("[主程式] 成功取得 {} 檔 S&P 500 成分股名單！", sp500_symbols.len());                                                                                         
+                                                                                                                                                                               
+        db.sync_sp500_constituents(&sp500_symbols).await?;                                                                                                                     
+        println!("[主程式] S&P 500 成分股對齊與同步完成！");                                                                                                                   
+                                                                                                                                                                            
+        // 關鍵功能註解：執行自動選股與歷史數據回填流程                                                                                                                        
+        selector::SelectionPipeline::run_pipeline(&client, &db,SelectionMode::Sp500Only).await?;     
+        */   
+        SelectionPipeline::backfill_portfolio_klines(&client,&db, None).await?;
 
-    // 關鍵功能註解：建立 HTTP 客戶端，並呼叫含快取判斷的資產抓取邏輯
-    let client = reqwest::Client::new();
-    let active_assets = AlpacaClient::get_assets(&client, &db).await?;
-
-    println!("[主程式] 成功取得 {} 檔可交易資產！", active_assets.len());
-    Ok(())
+                                                                                                                                                                               
+        println!("[主程式] 全套選股與歷史數據回填流程完成！");                                                                                                                 
+        Ok(())   
 /* 
     let client = reqwest::Client::new();
     //get_assets(&client).await?;

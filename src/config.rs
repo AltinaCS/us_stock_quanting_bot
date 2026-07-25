@@ -22,3 +22,11 @@ pub static DB_URL: LazyLock<String> = LazyLock::new(|| {
     std::env::var("DB_URL")
         .expect("找不到 DB_URL 環境變數喵！")
 });
+// 關鍵功能註解：設定選股與資產快取有效天數                                                                                                                   
+pub static CACHE_RETENTION_DAYS: LazyLock<i64> = LazyLock::new(|| {                                                                                           
+    let _ = dotenvy::dotenv();                                                                                                                                
+    std::env::var("CACHE_RETENTION_DAYS")                                                                                                                     
+        .ok()                                                                                                                                                 
+        .and_then(|v| v.parse().ok())                                                                                                                         
+        .unwrap_or(90)                                                                                                                                        
+});
