@@ -95,7 +95,37 @@ pub struct KLine {
     pub volume: i64,
     pub session: MarketSession,
 }
+//Yahoo的資料
+#[derive(Deserialize, Debug)]
+pub struct YahooResponse {
+    pub chart: YahooChart,
+}
 
+#[derive(Deserialize, Debug)]
+pub struct YahooChart {
+    pub result: Option<Vec<YahooResult>>,
+    pub error: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct YahooResult {
+    pub timestamp: Option<Vec<i64>>,
+    pub indicators: YahooIndicators,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct YahooIndicators {
+    pub quote: Vec<YahooQuote>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct YahooQuote {
+    pub open: Vec<Option<f64>>,
+    pub high: Vec<Option<f64>>,
+    pub low: Vec<Option<f64>>,
+    pub close: Vec<Option<f64>>,
+    pub volume: Vec<Option<i64>>,
+}
 pub struct AlpacaClient;
 
 impl AlpacaClient {
@@ -158,89 +188,116 @@ impl AlpacaClient {
 
     Ok(active_assets)
 }
-    // 關鍵功能註解：向Alpaca請求K線並轉換為通用KLine結構
-    pub async fn fetch_5m_data(client: &reqwest::Client,asset_id: Uuid,symbol: &str,start_iso: Option<&str>, 
-        end_iso: Option<&str>) -> Result<Vec<KLine>, Box<dyn std::error::Error>> {
-        let now = Utc::now();
 
-        // 若未提供 end_iso，預設為當前 UTC 時間
-        let mut end_dt = match end_iso {
-            Some(e) => DateTime::parse_from_rfc3339(e)
-                .map_err(|_| format!("end_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", e))?
-                .with_timezone(&Utc),
-            None => now,
-        };
+    // 注意 這邊是跟Yahoo Finance請求資料
+   pub async fn fetch_price_data(
+    client: &reqwest::Client,
+    asset_id: Uuid,
+    symbol: &str,
+    timeframe: &Timeframe,
+    start_iso: Option<&str>, 
+    end_iso: Option<&str>,
+) -> Result<Vec<KLine>, Box<dyn std::error::Error>> {
+    let now = Utc::now();
 
-        // 2. 解析或設定預設 start 時間
-        let start_dt = match start_iso {
-            Some(s) => DateTime::parse_from_rfc3339(s)
-                .map_err(|_| format!("start_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", s))?
-                .with_timezone(&Utc),
-            None => now - Duration::days(4),
-        };
-        // 防禦 1：邏輯倒置檢查 (start 比 end 還晚)
-        if start_dt > end_dt {
-            return Err(format!(
-                "時間邏輯錯誤：起始時間 ({}) 不能晚於結束時間 ({}) 喵！",
-                start_dt.to_rfc3339(),
-                end_dt.to_rfc3339()
-            ).into());
+    // 關鍵功能註解：根據時間週期解析並處理預設之時間邊界
+    let (start_dt, end_dt, interval_str) = match timeframe {
+        Timeframe::FiveMinutes => (now - Duration::days(59), now, "5m"),
+        Timeframe::OneDay => {
+            let mut end = match end_iso {
+                Some(e) => DateTime::parse_from_rfc3339(e)
+                    .map_err(|_| format!("end_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", e))?
+                    .with_timezone(&Utc),
+                None => now,
+            };
+            if end > now {
+                end = now;
+            }
+
+            let start = match start_iso {
+                Some(s) => DateTime::parse_from_rfc3339(s)
+                    .map_err(|_| format!("start_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", s))?
+                    .with_timezone(&Utc),
+                None => now - Duration::days(365 * 5),
+            };
+
+            if start > end {
+                return Err(format!(
+                    "時間邏輯錯誤：起始時間 ({}) 不能晚於結束時間 ({}) 喵！",
+                    start.to_rfc3339(),
+                    end.to_rfc3339()
+                ).into());
+            }
+
+            (start, end, "1d")
         }
+    };
 
-        // 防禦 2：未來時間檢查 (start 時間直接超越現在)
-        if start_dt > now {
-            return Err(format!(
-                "時間邏輯錯誤：起始時間 ({}) 為未來時間，不可超越當前時間 ({}) 喵！",
-                start_dt.to_rfc3339(),
-                now.to_rfc3339()
-            ).into());
-        }
+    // 關鍵功能註解：將 DateTime 轉為 Yahoo 要求的 Unix Timestamp 秒數
+    let period1 = start_dt.timestamp();
+    let period2 = end_dt.timestamp();
 
-        // 防禦 3：結束時間若超越現在，自動下修裁切為當前時間
-        if end_dt > now {
-            end_dt = now;
-        }
-        let start_str = start_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let end_str = end_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let url = format!(
-            "https://data.alpaca.markets/v2/stocks/{}/bars?timeframe=5Min&start={}&end={}&limit=10000&feed=iex&sort=asc",
-            symbol, start_str, end_str
-        );
-        
-        let response = client.get(&url)
-            .header("APCA-API-KEY-ID", &*config::API_KEY)
-            .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
-            .send()
-            .await?;
-        if !response.status().is_success() {
+    // 關鍵功能註解：構建帶有時間週期與盤前盤後參數之 Yahoo v8 Chart URL
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={}&period1={}&period2={}&includePrePost=true",
+        symbol, interval_str, period1, period2
+    );
+
+    let response = client.get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
         let err_text = response.text().await?;
         return Err(format!("API 請求失敗: {}", err_text).into());
-     }
-        let text = response.text().await?;
-    
-    // 關鍵功能註解：嘗試將原始回應反序列化並在失敗時印出偵錯資訊
-        let parsed: AlpacaBarResponse = serde_json::from_str(&text).map_err(|e| {
-            println!("偵錯 - 標的: {}, 解析失敗原因: {}", symbol, e);
-            println!("偵錯 - 原始 API 回應內容: {}", text);
-            e
-        })?;
-        let mut klines: Vec<KLine> = Vec::new();
-        for b in parsed.bars {
-        let ts = b.timestamp.timestamp();
-        klines.push(KLine {
-            asset_id: asset_id,
-            symbol: symbol.to_string(),
-            timestamp: ts,
-            open: b.open,
-            high: b.high,
-            low: b.low,
-            close: b.close,
-            volume: b.volume,
-            session: Preprocessor::determine_session(ts),
-        });
     }
+
+    let text = response.text().await?;
+
+    // 關鍵功能註解：嘗試將 Yahoo 原始 JSON 解析並印出詳細偵錯訊息
+    let parsed: YahooResponse = serde_json::from_str(&text).map_err(|e| {
+        println!("偵錯 - 標的: {}, 解析失敗原因: {}", symbol, e);
+        println!("偵錯 - 原始 API 回應內容: {}", text);
+        e
+    })?;
+
+    let mut klines: Vec<KLine> = Vec::new();
+
+    if let Some(results) = parsed.chart.result {
+        if let Some(res) = results.into_iter().next() {
+            let timestamps = res.timestamp.unwrap_or_default();
+            if let Some(quote) = res.indicators.quote.into_iter().next() {
+                // 關鍵功能註解：使用 zip 將對齊的 Columnar 平行陣列組裝回 KLine 物件
+                for i in 0..timestamps.len() {
+                    let ts = timestamps[i];
+                    
+                    if let (Some(open), Some(high), Some(low), Some(close), Some(volume)) = (
+                        quote.open.get(i).and_then(|v| *v),
+                        quote.high.get(i).and_then(|v| *v),
+                        quote.low.get(i).and_then(|v| *v),
+                        quote.close.get(i).and_then(|v| *v),
+                        quote.volume.get(i).and_then(|v| *v),
+                    ) {
+                        klines.push(KLine {
+                            asset_id,
+                            symbol: symbol.to_string(),
+                            timestamp: ts,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            session: Preprocessor::determine_session(ts),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     Ok(klines)
-    }
+}
     pub fn is_market_window_open() -> bool {
     let now = Utc::now();
     
@@ -351,7 +408,10 @@ pub enum TargetType {
     Indicator, // VIX / SPY 大盤風向標 (不計入權重和)
     Cash,      // 保留現金 (符號固定為 "USD" 或 "CASH")
 }
-
+pub enum Timeframe {
+    FiveMinutes,
+    OneDay,
+}
 // 關鍵功能註解：標的狀態 Enum
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -425,6 +485,28 @@ impl MarketDatabase {
         )
         .execute(&pool)
         .await?;
+        //日k線
+        sqlx::query(
+        "CREATE TABLE IF NOT EXISTS daily_prices (
+            asset_id UUID NOT NULL,
+            timestamp BIGINT NOT NULL,
+            open NUMERIC(20,4) NOT NULL,
+            high NUMERIC(20,4) NOT NULL,
+            low NUMERIC(20,4) NOT NULL,
+            close NUMERIC(20,4) NOT NULL,
+            volume BIGINT NOT NULL,
+            session INT NOT NULL,
+            PRIMARY KEY (asset_id, timestamp),
+            CONSTRAINT fk_daily_prices_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
+        );"
+        ).execute(&pool).await?;
+        // -----------------------------------------------------------------------------
+        // ⚠️ 警告 / WARNING ⚠️
+        // 此 klines 表格專門儲存 5 分鐘 K 線 (5m data)。
+        // 由於 API 數據源 (如 Yahoo Finance) 只保留近 60 天內之 5m 資料，
+        // 本表格資料為地端每日累積之不可逆歷史資產，絕對禁止執行 DROP, TRUNCATE,
+        // 或無條件的 DELETE 刪除操作！
+        // -----------------------------------------------------------------------------
         sqlx::query(
         "CREATE TABLE IF NOT EXISTS klines (
             asset_id UUID NOT NULL,
@@ -611,30 +693,43 @@ impl MarketDatabase {
             Ok(assets)                                                                                                                                                         
         }  
     // 關鍵功能註解：非同步寫入K線數據至本地資料庫
-   pub async fn save_klines(&self, klines: Vec<KLine>) -> Result<usize, String> {
+   // 關鍵功能註解：根據 Timeframe 列舉取得對應之資料庫表格名稱
+    fn get_table_name(timeframe: &Timeframe) -> &'static str {
+        match timeframe {
+            Timeframe::FiveMinutes => "klines",
+            Timeframe::OneDay => "daily_prices",
+        }
+    }
+
+    pub async fn save_klines(&self, timeframe: &Timeframe, klines: Vec<KLine>) -> Result<usize, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
         let mut inserted = 0;
+        let table_name = MarketDatabase::get_table_name(timeframe);
+
+        // 關鍵功能註解：拼接目標表格名稱並進行批次 Upsert 操作
+        let sql = format!(
+            "INSERT INTO {} (asset_id, timestamp, open, high, low, close, volume, session) 
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT(asset_id, timestamp) DO UPDATE SET
+            open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close, volume=excluded.volume",
+            table_name
+        );
 
         for k in klines {
             let asset_id_str = k.asset_id.to_string();
             
-            let res = sqlx::query(
-                "INSERT INTO klines (asset_id, timestamp, open, high, low, close, volume, session) 
-                 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT(asset_id, timestamp) DO UPDATE SET
-                 open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close, volume=excluded.volume"
-            )
-            .bind(asset_id_str)
-            .bind(k.timestamp)
-            .bind(k.open)
-            .bind(k.high)
-            .bind(k.low)
-            .bind(k.close)
-            .bind(k.volume)
-            .bind(k.session.to_int())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+            let res = sqlx::query(&sql)
+                .bind(asset_id_str)
+                .bind(k.timestamp)
+                .bind(k.open)
+                .bind(k.high)
+                .bind(k.low)
+                .bind(k.close)
+                .bind(k.volume)
+                .bind(k.session.to_int())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
 
             inserted += res.rows_affected() as usize;
         }
@@ -643,27 +738,34 @@ impl MarketDatabase {
         Ok(inserted)
     }
 
-    // 關鍵功能註解：非同步查詢對齊特定時間區間的K線數據
+    // 關鍵功能註解：根據指定時間週期與時間區間從對應表格查詢數據
     pub async fn query_klines_by_range(
         &self,
         asset_id: Uuid,
+        timeframe: &Timeframe,
         start: i64,
         end: i64,
     ) -> Result<Vec<KLine>, String> {
         let asset_id_str = asset_id.to_string();
-        let rows = sqlx::query(
+        let table_name =  MarketDatabase::get_table_name(timeframe);
+
+        // 關鍵功能註解：動態選擇 klines 或 daily_prices 表格進行讀取
+        let sql = format!(
             "SELECT k.asset_id::uuid, a.symbol, k.timestamp, k.open, k.high, k.low, k.close, k.volume, k.session 
-             FROM klines k
-             JOIN assets a ON k.asset_id = a.id
-             WHERE k.asset_id = $1 AND k.timestamp >= $2 AND k.timestamp <= $3
-             ORDER BY k.timestamp ASC"
-        )
-        .bind(asset_id_str)
-        .bind(start)
-        .bind(end)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+            FROM {} k
+            JOIN assets a ON k.asset_id = a.id
+            WHERE k.asset_id = $1 AND k.timestamp >= $2 AND k.timestamp <= $3
+            ORDER BY k.timestamp ASC",
+            table_name
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(asset_id_str)
+            .bind(start)
+            .bind(end)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let mut result = Vec::new();
         for row in rows {
@@ -683,26 +785,32 @@ impl MarketDatabase {
         Ok(result)
     }
 
-    // 關鍵功能註解：列出資料庫中所有K線資料並印出狀態
-    pub async fn list_all_klines(&self, limit_per_asset: Option<usize>) -> Result<(), String> {
+    // 關鍵功能註解：依據時間週期列出對應表格內之所有數據
+    pub async fn list_all_klines(&self, timeframe: &Timeframe, limit_per_asset: Option<usize>) -> Result<(), String> {
         let limit = limit_per_asset.unwrap_or(1000) as i64;
+        let table_name =  MarketDatabase::get_table_name(timeframe);
 
-        let assets_rows = sqlx::query(
+        // 關鍵功能註解：動態建構跨表 Target Asset 查詢語句
+        let assets_sql = format!(
             "SELECT DISTINCT k.asset_id, a.symbol 
-             FROM klines k 
-             JOIN assets a ON k.asset_id = a.id 
-             ORDER BY a.symbol ASC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+            FROM {} k 
+            JOIN assets a ON k.asset_id = a.id 
+            ORDER BY a.symbol ASC",
+            table_name
+        );
+
+        let assets_rows = sqlx::query(&assets_sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
         for a_row in assets_rows {
             let asset_id_str: String = a_row.get(0);
             let asset_id: Uuid = asset_id_str.parse::<uuid::Uuid>().map_err(|e: uuid::Error| e.to_string())?;
             let symbol: String = a_row.get(1);
 
-            let count_row = sqlx::query("SELECT COUNT(*) FROM klines WHERE asset_id = $1")
+            let count_sql = format!("SELECT COUNT(*) FROM {} WHERE asset_id = $1", table_name);
+            let count_row = sqlx::query(&count_sql)
                 .bind(&asset_id_str)
                 .fetch_one(&self.pool)
                 .await
@@ -711,22 +819,25 @@ impl MarketDatabase {
             let count: i64 = count_row.get(0);
 
             println!(
-                "=== 標的: {} ({}) (資料庫內總計 {} 筆) ===",
-                symbol, asset_id, count
+                "=== 標的: {} ({}) [資料表: {}] (資料庫內總計 {} 筆) ===",
+                symbol, asset_id, table_name, count
             );
 
-            let detail_rows = sqlx::query(
+            let detail_sql = format!(
                 "SELECT timestamp, open, high, low, close, volume, session
-                 FROM klines 
-                 WHERE asset_id = $1::uuid 
-                 ORDER BY timestamp DESC 
-                 LIMIT $2",
-            )
-            .bind(&asset_id_str)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
+                FROM {} 
+                WHERE asset_id = $1::uuid 
+                ORDER BY timestamp DESC 
+                LIMIT $2",
+                table_name
+            );
+
+            let detail_rows = sqlx::query(&detail_sql)
+                .bind(&asset_id_str)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
 
             for row in detail_rows {
                 let ts: i64 = row.get(0);

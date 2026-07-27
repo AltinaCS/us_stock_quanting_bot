@@ -1,6 +1,6 @@
 ﻿use std::collections::HashMap;                                                                                                                                 
 use serde::{Deserialize, Serialize};                                                                                                                           
-use crate::db_storage::{AlpacaAsset, AlpacaClient, KLine, MarketDatabase, PortfolioTarget, TargetStatus, TargetType};                                          
+use crate::db_storage::{AlpacaAsset, AlpacaClient, KLine, MarketDatabase, PortfolioTarget, TargetStatus, TargetType,Timeframe};                                          
 use crate::portfolio::PortfolioManager;                                                                                                                        
 use chrono::{DateTime, Utc};                                                                                                                                   
 use rust_decimal::Decimal;                                                                                                                                     
@@ -47,7 +47,7 @@ impl SelectionPipeline {
                     let now_secs = Utc::now().timestamp();                                                                                                        
                     let retention_secs = *crate::config::CACHE_RETENTION_DAYS * 24 * 3600;                                                                        
                     if (now_secs - latest_selected_at) < retention_secs {                                                                                         
-                        println!("[資料流 Step 0] 資料庫已有選股紀錄且未滿指定時間 ({} 天)，跳過選股 Pipeline 喵！", *crate::config::CACHE_RETENTION_DAYS);       
+                        println!("[資料流 Step 0] 資料庫已有選股紀錄且未滿指定時間 ({} 天)，跳過選股 Pipeline！(剩餘天數：{})", *crate::config::CACHE_RETENTION_DAYS,90-(now_secs - latest_selected_at)/(24*3600));       
                         return Ok(());                                                                                                                            
                     }                                                                                                                                             
                 }                                                                                                              
@@ -79,14 +79,15 @@ impl SelectionPipeline {
                                                                                                                                                                    
             println!("[資料流 Step 3] 開啟 {} 併發池進行平行數據抓取與評分...", max_concurrent);                                                                   
                                                                                                                                                                    
-            // 關鍵功能註解：平行化抓取資產數據並計算評分                                                                                                          
+            // 關鍵功能註解：平行化抓取資產數據並計算評分                
+            //TODO:如果要改選股策略就要在這裡下手                                                                                          
             let mut candidates_score: Vec<(AlpacaAsset, f64, f64)> = stream::iter(filtered_assets)                                                                 
                 .map(|asset| {                                                                                                                                     
                     let sem = Arc::clone(&semaphore);                                                                                                              
                     let start = start_30d.clone();                                                                                                                 
                     async move {                                                                                                                                   
                         let _permit = sem.acquire().await.unwrap();                                                                                                
-                        if let Ok(klines) = AlpacaClient::fetch_5m_data(client,asset.id, &asset.symbol, Some(&start), None).await {                                       
+                        if let Ok(klines) = AlpacaClient::fetch_price_data(client,asset.id, &asset.symbol, &Timeframe::FiveMinutes,Some(&start), None).await {                                       
                             if klines.is_empty() {                                                                                                                 
                                 return None;                                                                                                                       
                             }                                                                                                                                      
@@ -145,21 +146,30 @@ impl SelectionPipeline {
                                                                                                                                                                    
             for target in &portfolio_targets {                                                                                                                     
                 println!("正在回填歷史數據：{}", target.symbol);                                                                                                   
-                match AlpacaClient::fetch_5m_data(client,target.asset_id, &target.symbol, Some(start_2016), None).await {                                                 
+                match AlpacaClient::fetch_price_data(client,target.asset_id, &target.symbol,&Timeframe::FiveMinutes, Some(start_2016), None).await {                                                 
                     Ok(klines) => {                                                                                                                                
-                        let count = db.save_klines(klines).await.map_err(|e| e.to_string())?;                                                                      
+                        let count = db.save_klines(&Timeframe::FiveMinutes,klines).await.map_err(|e| e.to_string())?;                                                                      
                         println!("成功儲存 {} 筆 {} 的歷史 K 線", count, target.symbol);                                                                           
                     }                                                                                                                                              
                     Err(e) => println!("抓取 {} 歷史數據失敗: {}", target.symbol, e),                                                                              
-                }                                                                                                                                                  
-            }                                                                                                                                                      
+                }     
+                match AlpacaClient::fetch_price_data(client, target.asset_id, &target.symbol, &Timeframe::OneDay, Some(start_2016), None).await {
+                    Ok(klines) => {
+                        let count = db.save_klines(&Timeframe::OneDay, klines).await.map_err(|e| e.to_string())?;
+                        println!("成功儲存 {} 筆 {} 的 1d 歷史 K 線", count, target.symbol);
+                    }
+                    Err(e) => println!("抓取 {} 1d 歷史數據失敗: {}", target.symbol, e),
+                }                                                                                                                                             
+            }     
+            //再補一個1d的                                                                                                                                                 
                                                                                                                                                                    
             Ok(())                                                                                                                                                 
         }          
         pub async fn backfill_portfolio_klines(    
             client: &reqwest::Client,                                                                                                               
             db: &MarketDatabase,                                                                                                                                  
-            start_iso: Option<&str>,                                                                                                                              
+            start_iso: Option<&str>,
+            timeframe:&Timeframe                                                                                                                              
         ) -> Result<(), Box<dyn std::error::Error>> {                                                                                                             
             let targets = db.load_portfolio_targets().await?;                                                                                                     
             println!("[補資料] 成功載入 {} 檔 Portfolio 標的進行 K 線回填...", targets.len());                                                                    
@@ -172,9 +182,9 @@ impl SelectionPipeline {
                     continue;                                                                                                                                     
                 }                                                                                                                                                 
                 println!("正在回填歷史數據：{}", target.symbol);                                                                                                  
-                match AlpacaClient::fetch_5m_data(client,target.asset_id, &target.symbol, Some(start_time), None).await {                                                
+                match AlpacaClient::fetch_price_data(client,target.asset_id, &target.symbol,timeframe, Some(start_time), None).await {                                                
                     Ok(klines) => {                                                                                                                               
-                        let count = db.save_klines(klines).await.map_err(|e| e.to_string())?;                                                                     
+                        let count = db.save_klines(timeframe,klines).await.map_err(|e| e.to_string())?;                                                                     
                         println!("成功儲存 {} 筆 {} 的歷史 K 線", count, target.symbol);                                                                          
                     }                                                                                                                                             
                     Err(e) => println!("抓取 {} 歷史數據失敗: {}", target.symbol, e),                                                                             
