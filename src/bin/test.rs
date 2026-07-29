@@ -3,8 +3,8 @@ use chrono::{DateTime, TimeZone, Timelike, Utc, NaiveTime,Datelike};
 use quant_bot::db_storage::{MarketDatabase,AppConfig,AlpacaClient, Preprocessor};
 use chrono_tz::America::New_York;
 use quant_bot::trading::{OrderMethod, OrderTypeInput, Side, TimeInForce, place_order};
-use quant_bot::{config, selector};
-use quant_bot::db_storage;
+use quant_bot::{backtest, config, selector};
+use quant_bot::db_storage::{TimeframeConfig};
 use quant_bot::selector::{SelectionMode, SelectionPipeline};
 use rust_decimal_macros::dec;
 use rand::prelude::IndexedRandom;
@@ -13,11 +13,28 @@ use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, BTreeSet};
 use std::fs;
 use rand::RngExt;
+use crate::backtest::AnalysisConfig;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::env;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+   // 關鍵功能註解：建立資料庫連線實例與HTTP客戶端
     let db = MarketDatabase::new().await?;
-    let client =reqwest::Client::new();
+    let client = reqwest::Client::new();
+
+    // 關鍵功能註解：從投資組合資料表載入現有標的並提取代碼清單
+    let targets = db.load_portfolio_targets().await?;
+    let symbols: Vec<String> = targets
+        .into_iter()
+        .map(|t| t.symbol)
+        .collect();
+    let analysis_config:AnalysisConfig  = AnalysisConfig{..Default::default()};
+    // 執行歷史數據統計分析流程
+    backtest::run_analysis(&client, &db, &symbols, &analysis_config).await?;
+
+    Ok(())
+    /* 
     // 關鍵功能註解：線上抓取S&P500成分股並同步至資料庫                                                                                                         
         println!("[主程式] 開始線上抓取 S&P 500 成分股...");                                                                                                                   
         let sp500_symbols = MarketDatabase::fetch_sp500_symbols(&client).await?;                                                                                                               
@@ -31,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                                                                                                                                
         println!("[主程式] 全套選股與歷史數據回填流程完成！");                                                                                                                                                                                                                            
         Ok(())   
+        */
 /* 
     let client = reqwest::Client::new();
     //get_assets(&client).await?;

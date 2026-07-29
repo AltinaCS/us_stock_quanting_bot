@@ -194,7 +194,7 @@ impl AlpacaClient {
     client: &reqwest::Client,
     asset_id: Uuid,
     symbol: &str,
-    timeframe: &Timeframe,
+    timeframe: &TimeframeConfig,
     start_iso: Option<&str>, 
     end_iso: Option<&str>,
 ) -> Result<Vec<KLine>, Box<dyn std::error::Error>> {
@@ -202,8 +202,8 @@ impl AlpacaClient {
 
     // 關鍵功能註解：根據時間週期解析並處理預設之時間邊界
     let (start_dt, end_dt, interval_str) = match timeframe {
-        Timeframe::FiveMinutes => (now - Duration::days(59), now, "5m"),
-        Timeframe::OneDay => {
+        TimeframeConfig::FiveMinutes => (now - Duration::days(59), now, "5m"),
+        TimeframeConfig::OneDay => {
             let mut end = match end_iso {
                 Some(e) => DateTime::parse_from_rfc3339(e)
                     .map_err(|_| format!("end_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", e))?
@@ -408,7 +408,8 @@ pub enum TargetType {
     Indicator, // VIX / SPY 大盤風向標 (不計入權重和)
     Cash,      // 保留現金 (符號固定為 "USD" 或 "CASH")
 }
-pub enum Timeframe {
+#[derive(Debug, Clone)]
+pub enum TimeframeConfig {
     FiveMinutes,
     OneDay,
 }
@@ -694,55 +695,63 @@ impl MarketDatabase {
         }  
     // 關鍵功能註解：非同步寫入K線數據至本地資料庫
    // 關鍵功能註解：根據 Timeframe 列舉取得對應之資料庫表格名稱
-    fn get_table_name(timeframe: &Timeframe) -> &'static str {
+    fn get_table_name(timeframe: &TimeframeConfig) -> &'static str {
         match timeframe {
-            Timeframe::FiveMinutes => "klines",
-            Timeframe::OneDay => "daily_prices",
+            TimeframeConfig::FiveMinutes => "klines",
+            TimeframeConfig::OneDay => "daily_prices",
         }
     }
 
-    pub async fn save_klines(&self, timeframe: &Timeframe, klines: Vec<KLine>) -> Result<usize, String> {
-        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        let mut inserted = 0;
-        let table_name = MarketDatabase::get_table_name(timeframe);
-
-        // 關鍵功能註解：拼接目標表格名稱並進行批次 Upsert 操作
-        let sql = format!(
-            "INSERT INTO {} (asset_id, timestamp, open, high, low, close, volume, session) 
-            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT(asset_id, timestamp) DO UPDATE SET
-            open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close, volume=excluded.volume",
-            table_name
-        );
-
-        for k in klines {
-            let asset_id_str = k.asset_id.to_string();
-            
-            let res = sqlx::query(&sql)
-                .bind(asset_id_str)
-                .bind(k.timestamp)
-                .bind(k.open)
-                .bind(k.high)
-                .bind(k.low)
-                .bind(k.close)
-                .bind(k.volume)
-                .bind(k.session.to_int())
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            inserted += res.rows_affected() as usize;
+    pub async fn save_klines(
+        &self,
+        timeframe: &TimeframeConfig,
+        klines: Vec<KLine>,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        if klines.is_empty() {
+            return Ok(0);
         }
 
-        tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(inserted)
+        let table_name =MarketDatabase::get_table_name(timeframe);
+
+        let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(format!(
+        "INSERT INTO {} (asset_id, timestamp, open, high, low, close, volume, session) ",
+        table_name
+    ));
+
+    // 關鍵功能註解：動態展開VALUES綁定並將asset_id顯式轉型為uuid
+    builder.push_values(&klines, |mut b, kline| {
+        let asset_id_str = kline.asset_id.to_string();
+        b.push_bind(asset_id_str)
+         .push_unseparated("::uuid")
+         .push_bind(kline.timestamp)
+         .push_bind(&kline.open)
+         .push_bind(&kline.high)
+         .push_bind(&kline.low)
+         .push_bind(&kline.close)
+         .push_bind(kline.volume)
+         .push_bind(kline.session.to_int());
+    });
+
+    builder.push(
+        " ON CONFLICT (asset_id, timestamp) DO UPDATE SET \
+         open = EXCLUDED.open, \
+         high = EXCLUDED.high, \
+         low = EXCLUDED.low, \
+         close = EXCLUDED.close, \
+         volume = EXCLUDED.volume, \
+         session = EXCLUDED.session"
+    );
+
+    let result = builder.build().execute(&self.pool).await?;
+
+        Ok(result.rows_affected())
     }
 
     // 關鍵功能註解：根據指定時間週期與時間區間從對應表格查詢數據
     pub async fn query_klines_by_range(
         &self,
         asset_id: Uuid,
-        timeframe: &Timeframe,
+        timeframe: &TimeframeConfig,
         start: i64,
         end: i64,
     ) -> Result<Vec<KLine>, String> {
@@ -751,10 +760,10 @@ impl MarketDatabase {
 
         // 關鍵功能註解：動態選擇 klines 或 daily_prices 表格進行讀取
         let sql = format!(
-            "SELECT k.asset_id::uuid, a.symbol, k.timestamp, k.open, k.high, k.low, k.close, k.volume, k.session 
+            "SELECT k.asset_id::text, a.symbol, k.timestamp, k.open::float8, k.high::float8, k.low::float8, k.close::float8, k.volume::int8, k.session 
             FROM {} k
             JOIN assets a ON k.asset_id = a.id
-            WHERE k.asset_id = $1 AND k.timestamp >= $2 AND k.timestamp <= $3
+            WHERE k.asset_id = $1::uuid AND k.timestamp >= $2 AND k.timestamp <= $3
             ORDER BY k.timestamp ASC",
             table_name
         );
@@ -786,7 +795,7 @@ impl MarketDatabase {
     }
 
     // 關鍵功能註解：依據時間週期列出對應表格內之所有數據
-    pub async fn list_all_klines(&self, timeframe: &Timeframe, limit_per_asset: Option<usize>) -> Result<(), String> {
+    pub async fn list_all_klines(&self, timeframe: &TimeframeConfig, limit_per_asset: Option<usize>) -> Result<(), String> {
         let limit = limit_per_asset.unwrap_or(1000) as i64;
         let table_name =  MarketDatabase::get_table_name(timeframe);
 
@@ -1058,4 +1067,55 @@ impl MarketDatabase {
             tx.commit().await.map_err(|e| e.to_string())?;                                                                                                         
             Ok(count)                                                                                                                                              
         }
+        
+        pub async fn is_kline_range_sufficient(
+    &self,
+    asset_id: &uuid::Uuid,
+    timeframe: &TimeframeConfig,
+    required_start_iso: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let table_name = match timeframe {
+        TimeframeConfig::OneDay => "daily_prices",
+        TimeframeConfig::FiveMinutes => "klines",
+    };
+
+    // 關鍵功能註解：一次撈出最小時間、最大時間與總筆數
+    let query_str = format!(
+        "SELECT MIN(timestamp), MAX(timestamp), COUNT(*)::bigint FROM {} WHERE asset_id = $1::uuid",
+        table_name
+    );
+
+    let row: Option<(Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(&query_str)
+        .bind(asset_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+    let (db_min_ts, db_max_ts, count) = match row {
+        Some((Some(min), Some(max), Some(cnt))) => (min, max, cnt),
+        _ => return Ok(false),
+    };
+
+    let req_start_ts = chrono::DateTime::parse_from_rfc3339(required_start_iso)?.timestamp();
+    let now_ts = chrono::Utc::now().timestamp();
+
+    let max_allowed_lag_sec = match timeframe {
+        TimeframeConfig::OneDay => 86400 * 3,     // 3 天 (考慮週末休市)
+        TimeframeConfig::FiveMinutes => 86400 * 2, // 2 天
+    };
+
+    let has_valid_start = db_min_ts <= req_start_ts;
+    let has_valid_end = (now_ts - db_max_ts) <= max_allowed_lag_sec;
+
+    // 關鍵功能註解：以請求開始時間至當前時間計算應有總天數
+    let total_days = (now_ts - req_start_ts).max(86400) as f64 / 86400.0;
+    let expected_min_count = match timeframe {
+        TimeframeConfig::OneDay => (total_days * 0.6) as i64,
+        TimeframeConfig::FiveMinutes => (total_days * 0.6 * 78.0) as i64,
+    };
+
+    let has_sufficient_density = count >= expected_min_count;
+
+    // 關鍵功能註解：將數據密度結果正式列入判定
+    Ok(has_valid_start && has_valid_end && has_sufficient_density)
+}
 }
