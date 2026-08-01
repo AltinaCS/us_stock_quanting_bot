@@ -1,16 +1,28 @@
 ﻿use std::collections::{BTreeMap,BTreeSet,HashMap};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc,NaiveDate};
+use serde::Serialize;
 use crate::{db_storage::{MarketDatabase, TimeframeConfig,TargetType,KLine}, selector::SelectionPipeline};
-use nalgebra::DMatrix;
 use tracing::warn;
+use std::time::Instant;
 use uuid::Uuid;
-#[derive(Debug, Clone)]
+use anyhow::{anyhow,Context,Result};
+pub type FeatureMatrix = HashMap<i64, HashMap<String, HashMap<String, f64>>>;
+use ndarray::{Array1, Array2, Axis};
+use nalgebra::{DMatrix, DVector};
+use std::fs::File;
+use std::io::BufWriter;
+#[derive(Debug, Clone,Serialize)]
 pub struct DailyLogReturns {
     pub timestamps: Vec<i64>,
     /// 每檔標的對應的單期 Log Return 時間序列 (長度為 timestamps.len() - 1)
     pub returns: BTreeMap<String, Vec<Option<f64>>>,
 }
-
+#[derive(Debug, Clone)]
+pub struct LatentFactorResult {
+    pub factor_loadings: HashMap<String, Vec<f64>>,
+    pub alpha_residuals: HashMap<String, f64>,
+    pub explained_variance_ratio: Vec<f64>,
+}
 /// 關鍵功能註解：3.1 基礎統計特徵結果，包含單資產年化統計與全資產共變異數
 #[derive(Debug, Clone)]
 pub struct BaseStatistics {
@@ -25,14 +37,18 @@ pub struct BaseStatistics {
     /// 標的間的相關係數矩陣 (與 symbols 順序一致)
     pub correlation_matrix: DMatrix<f64>,
 }
-
+#[derive(Debug, Clone)]
+struct GarchResult {
+    pub last_variance: f64,
+}
+#[derive(Debug, Clone)]
 pub struct AlignedMarketData {
     // 時間軸標籤：所有有效的市場交易日
     pub timestamps: Vec<i64>,
     // 每個 symbol 對應的對齊後收盤價矩陣 (Options 代表 IPO 前為 None)
     pub prices: BTreeMap<String, Vec<Option<f64>>>,
 }
-
+#[derive(Debug, Clone)]
 pub struct DailyPriceSnapshot {
     pub timestamp: DateTime<Utc>,
     pub prices: BTreeMap<String, f64>,
@@ -66,7 +82,411 @@ impl Default for AnalysisConfig {
         }
     }
 }
+fn fit_garch11(returns: &[f64]) -> GarchResult {
+    let omega = 0.000005;
+    let alpha = 0.08;
+    let beta = 0.90;
+    let n = returns.len();
 
+    let mut cond_var = vec![0.0001; n];
+    let sample_var = if n > 0 {
+        returns.iter().map(|x| x * x).sum::<f64>() / n as f64
+    } else {
+        0.0001
+    };
+
+    cond_var[0] = sample_var.max(0.0001);
+    for t in 1..n {
+        cond_var[t] = omega + alpha * returns[t - 1].powi(2) + beta * cond_var[t - 1];
+    }
+
+    GarchResult {
+        last_variance: *cond_var.last().unwrap_or(&0.0001),
+    }
+}
+
+// 關鍵功能註解：對PCA因子擬合GARCH並構建因子動態協方差矩陣
+pub fn compute_factor_garch_cov(
+    daily_log_returns: &DailyLogReturns,
+    latent_result: &LatentFactorResult,
+    num_components: usize,
+) -> Result<HashMap<String, HashMap<String, f64>>> {
+    let symbols: Vec<String> = daily_log_returns.returns.keys().cloned().collect();
+    let num_assets = symbols.len();
+    let num_observations = if daily_log_returns.timestamps.len() > 1 {
+        daily_log_returns.timestamps.len() - 1
+    } else {
+        0
+    };
+
+    if num_assets == 0 || num_observations < 5 {
+        return Err(anyhow!("歷史觀察資料不足，無法執行 Factor GARCH"));
+    }
+
+    let mut matrix_data = Vec::with_capacity(num_observations * num_assets);
+    for t in 0..num_observations {
+        for symbol in &symbols {
+            let ret = daily_log_returns.returns[symbol]
+                .get(t)
+                .and_then(|&opt| opt)
+                .unwrap_or(0.0);
+            matrix_data.push(ret);
+        }
+    }
+
+    let returns_matrix = Array2::from_shape_vec((num_observations, num_assets), matrix_data)
+        .context("無法轉換為 ndarray 矩陣")?;
+    let means = returns_matrix
+        .mean_axis(Axis(0))
+        .ok_or_else(|| anyhow!("無法計算均值"))?;
+    let centered_matrix = &returns_matrix - &means;
+
+    let mut factor_variances = Vec::with_capacity(num_components);
+    let mut factor_scores_matrix = Array2::zeros((num_observations, num_components));
+
+    for k in 0..num_components {
+        let mut loading_vec = Array1::zeros(num_assets);
+        for (idx, symbol) in symbols.iter().enumerate() {
+            if let Some(loadings) = latent_result.factor_loadings.get(symbol) {
+                loading_vec[idx] = loadings[k];
+            }
+        }
+
+        let f_k = centered_matrix.dot(&loading_vec);
+        for t in 0..num_observations {
+            factor_scores_matrix[[t, k]] = f_k[t];
+        }
+
+        let garch_res = fit_garch11(f_k.as_slice().unwrap_or(&[]));
+        factor_variances.push(garch_res.last_variance);
+    }
+
+    let mut residual_variances = HashMap::new();
+    for (idx, symbol) in symbols.iter().enumerate() {
+        let actual = centered_matrix.column(idx);
+        let mut recon:Array1<f64> = Array1::zeros(num_observations);
+        if let Some(loadings) = latent_result.factor_loadings.get(symbol) {
+            for k in 0..num_components {
+                let f_k = factor_scores_matrix.column(k);
+                recon = recon + (&f_k * loadings[k]);
+            }
+        }
+        let res = &actual - &recon;
+        let res_var = res.iter().map(|x| x * x).sum::<f64>() / (num_observations as f64);
+        residual_variances.insert(symbol.clone(), res_var);
+    }
+
+    let mut cov_map: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    for symbol_i in &symbols {
+        let loadings_i = latent_result
+            .factor_loadings
+            .get(symbol_i)
+            .ok_or_else(|| anyhow!("缺少資產 {} 之因子載荷", symbol_i))?;
+        let res_var_i = residual_variances.get(symbol_i).cloned().unwrap_or(0.0);
+
+        let mut row_map = HashMap::new();
+        for symbol_j in &symbols {
+            let loadings_j = latent_result
+                .factor_loadings
+                .get(symbol_j)
+                .ok_or_else(|| anyhow!("缺少資產 {} 之因子載荷", symbol_j))?;
+
+            let mut sys_cov = 0.0;
+            for k in 0..num_components {
+                sys_cov += loadings_i[k] * factor_variances[k] * loadings_j[k];
+            }
+
+            if symbol_i == symbol_j {
+                sys_cov += res_var_i;
+            }
+
+            row_map.insert(symbol_j.clone(), sys_cov);
+        }
+        cov_map.insert(symbol_i.clone(), row_map);
+    }
+
+    Ok(cov_map)
+}
+pub fn compute_cross_sectional_pca(
+    daily_log_returns: &DailyLogReturns,
+    num_components: usize,
+) -> Result<LatentFactorResult> {
+    if daily_log_returns.returns.is_empty() {
+        return Err(anyhow!("輸入的 daily_log_returns 資料為空"));
+    }
+
+    // 1. 取得所有標的鍵值與觀察天數 (長度為 timestamps.len() - 1)
+    let symbols: Vec<String> = daily_log_returns.returns.keys().cloned().collect();
+    let num_assets = symbols.len();
+    let num_observations = if daily_log_returns.timestamps.len() > 1 {
+        daily_log_returns.timestamps.len() - 1
+    } else {
+        0
+    };
+
+    if num_assets < num_components {
+        return Err(anyhow!(
+            "資產數量 ({}) 少於要求的主成分數量 ({})",
+            num_assets,
+            num_components
+        ));
+    }
+
+    if num_observations < 5 {
+        return Err(anyhow!("歷史觀察天數過少，無法執行 PCA"));
+    }
+
+    // 2. 構建報酬率矩陣 R (T x N, T為天數, N為資產數)，將 Option<f64> 解包並補 0.0
+    let mut matrix_data = Vec::with_capacity(num_observations * num_assets);
+    for t in 0..num_observations {
+        for symbol in &symbols {
+            let ret = daily_log_returns.returns[symbol]
+                .get(t)
+                .and_then(|&opt| opt)
+                .unwrap_or(0.0);
+            matrix_data.push(ret);
+        }
+    }
+
+    let returns_matrix = Array2::from_shape_vec((num_observations, num_assets), matrix_data)
+        .context("無法將報酬率資料轉換為 ndarray 矩陣")?;
+
+    // 3. 報酬率矩陣去中心化
+    // 關鍵功能註解：對各標的報酬率序列進行中心化處理以計算標準協變異數
+    let means = returns_matrix
+        .mean_axis(Axis(0))
+        .ok_or_else(|| anyhow!("無法計算報酬率均值"))?;
+    let centered_matrix = &returns_matrix - &means;
+
+    // 4. 計算資產協變異數矩陣 Cov = (X^T * X) / (T - 1)
+    let t_minus_1 = (num_observations - 1) as f64;
+    let cov_matrix = centered_matrix.t().dot(&centered_matrix) / t_minus_1;
+
+    // 5. 執行特徵值分解
+    // 關鍵功能註解：透過協變異數矩陣分解提取主成分特徵向量與解釋變異數
+    let (eigenvalues, eigenvectors) = symmetric_eigen(&cov_matrix)?;
+
+    // 6. 排序特徵值與特徵向量 (降冪)
+    let mut eigen_pairs: Vec<(f64, Array1<f64>)> = eigenvalues
+        .iter()
+        .zip(eigenvectors.axis_iter(Axis(1)))
+        .map(|(&val, vec)| (val, vec.to_owned()))
+        .collect();
+
+    eigen_pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_variance: f64 = eigen_pairs.iter().map(|(val, _)| val.max(0.0)).sum();
+
+    // 7. 提取前 k 個主成分因子載荷與解釋比例
+    let mut factor_loadings: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut explained_variance_ratio = Vec::with_capacity(num_components);
+
+    for (symbol_idx, symbol) in symbols.iter().enumerate() {
+        let mut loadings = Vec::with_capacity(num_components);
+        for k in 0..num_components {
+            loadings.push(eigen_pairs[k].1[symbol_idx]);
+        }
+        factor_loadings.insert(symbol.clone(), loadings);
+    }
+
+    for k in 0..num_components {
+        let var_k = eigen_pairs[k].0.max(0.0);
+        explained_variance_ratio.push(if total_variance > 0.0 { var_k / total_variance } else { 0.0 });
+    }
+
+    // 8. 重構系統報酬率並提取特質 Alpha 殘差
+    // 關鍵功能註解：計算扣除共性因子後之個股殘差 Alpha 向量
+    let mut alpha_residuals: HashMap<String, f64> = HashMap::new();
+
+    for (symbol_idx, symbol) in symbols.iter().enumerate() {
+        let actual_returns = centered_matrix.column(symbol_idx);
+        
+        // 修正型態標註：明確指定 Array1<f64> 型態以通過編譯器推導
+        let mut reconstructed: Array1<f64> = Array1::zeros(num_observations);
+
+        for k in 0..num_components {
+            let loading = eigen_pairs[k].1[symbol_idx];
+            let factor_score = centered_matrix.dot(&eigen_pairs[k].1);
+            reconstructed = reconstructed + (&factor_score * loading);
+        }
+
+        let residual = &actual_returns - &reconstructed;
+        let latest_alpha = residual[num_observations - 1];
+        alpha_residuals.insert(symbol.clone(), latest_alpha);
+    }
+
+    Ok(LatentFactorResult {
+        factor_loadings,
+        alpha_residuals,
+        explained_variance_ratio,
+    })
+}
+
+/// 關鍵功能註解：對實對稱矩陣執行 Jacobi 特徵值分解與特徵向量求解
+fn symmetric_eigen(cov: &Array2<f64>) -> Result<(Vec<f64>, Array2<f64>)> {
+    let n = cov.nrows();
+    let mut a = cov.clone();
+    let mut v = Array2::<f64>::eye(n);
+
+    for _ in 0..100 {
+        let mut max_off_diag = 0.0;
+        let mut p = 0;
+        let mut q = 0;
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if a[[i, j]].abs() > max_off_diag {
+                    max_off_diag = a[[i, j]].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+
+        if max_off_diag < 1e-10 {
+            break;
+        }
+
+        let app = a[[p, p]];
+        let aqq = a[[q, q]];
+        let apq = a[[p, q]];
+
+        let theta = 0.5 * (aqq - app) / apq;
+        let t = if theta >= 0.0 {
+            1.0 / (theta + (theta * theta + 1.0).sqrt())
+        } else {
+            -1.0 / (-theta + (theta * theta + 1.0).sqrt())
+        };
+
+        let c = 1.0 / (t * t + 1.0).sqrt();
+        let s = t * c;
+
+        a[[p, p]] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        a[[q, q]] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        a[[p, q]] = 0.0;
+        a[[q, p]] = 0.0;
+
+        for i in 0..n {
+            if i != p && i != q {
+                let aip = a[[i, p]];
+                let aiq = a[[i, q]];
+                a[[i, p]] = c * aip - s * aiq;
+                a[[p, i]] = a[[i, p]];
+                a[[i, q]] = s * aip + c * aiq;
+                a[[q, i]] = a[[i, q]];
+            }
+
+            let vip = v[[i, p]];
+            let viq = v[[i, q]];
+            v[[i, p]] = c * vip - s * viq;
+            v[[i, q]] = s * vip + c * viq;
+        }
+    }
+
+    let eigenvalues = (0..n).map(|i| a[[i, i]]).collect();
+    Ok((eigenvalues, v))
+}
+/// 關鍵功能註解：依據日期字串或預設最新日計算純量價多維特徵矩陣
+pub fn compute_pure_price_features(
+    aligned_data: &AlignedMarketData,
+    target_timestamp: i64,
+) -> Result<HashMap<String, HashMap<String, f64>>> {
+    if aligned_data.timestamps.is_empty() {
+        return Err(anyhow!("AlignedMarketData 時間軸資料為空"));
+    }
+
+    let target_idx = aligned_data
+        .timestamps
+        .iter()
+        .rposition(|&t| t <= target_timestamp)
+        .ok_or_else(|| anyhow!("目標時間戳記 {} 未早於 aligned_data 時間軸中", target_timestamp))?;
+
+    let max_window_size = 20usize;
+    let min_required_days = 5usize;
+
+    // 全局時間軸長度判斷：若歷史天數連最小要求都不到才 Err
+    if target_idx < min_required_days {
+        return Err(anyhow!("歷史資料天數不足 {} 日，無法計算滑動視窗特徵", min_required_days));
+    }
+
+    let mut symbol_features_map: HashMap<String, HashMap<String, f64>> = HashMap::new();
+
+    for (symbol, price_series) in &aligned_data.prices {
+        let actual_available_days = target_idx;
+        let effective_window = actual_available_days.min(max_window_size);
+
+        let window_slice = &price_series[target_idx - effective_window..=target_idx];
+        let valid_prices: Vec<f64> = window_slice.iter().filter_map(|&p| p).collect();
+
+        // 單一標的資料天數不足則安全跳過，由後續權重模組處理 (例如設為 0 權重)
+        if valid_prices.len() < min_required_days {
+            continue;
+        }
+
+        let current_len = valid_prices.len();
+        let current_price = valid_prices[current_len - 1];
+        let prev_price = valid_prices[current_len - 2];
+
+        let mut feature_map: HashMap<String, f64> = HashMap::new();
+
+        // 1. 1D 連續對數報酬率
+        // 關鍵功能註解：計算單期對數報酬率以供動量與異常衝擊判斷
+        let log_return = (current_price / prev_price).ln();
+        feature_map.insert("log_return_1d".to_string(), log_return);
+
+        // 2. 動態實現波動度 (Realized Volatility)
+        // 關鍵功能註解：依據當前標的可用的歷史天數動態估算實現波動度
+        let mut returns = Vec::with_capacity(current_len - 1);
+        for i in 1..current_len {
+            returns.push((valid_prices[i] / valid_prices[i - 1]).ln());
+        }
+        let ret_mean = returns.iter().sum::<f64>() / (returns.len() as f64);
+        let ret_var = returns.iter().map(|r| (r - ret_mean).powi(2)).sum::<f64>() / (returns.len() as f64);
+        feature_map.insert("realized_vol".to_string(), ret_var.sqrt());
+
+        // 3. 動態相對強弱指標 (RSI)
+        // 關鍵功能註解：自動調整週期計算 RSI 以反映極端超買超賣
+        let rsi_period = (current_len - 1).min(14);
+        let mut gains = 0.0;
+        let mut losses = 0.0;
+        for i in (current_len - rsi_period)..current_len {
+            let diff = valid_prices[i] - valid_prices[i - 1];
+            if diff > 0.0 {
+                gains += diff;
+            } else {
+                losses += diff.abs();
+            }
+        }
+        let avg_gain = gains / (rsi_period as f64);
+        let avg_loss = losses / (rsi_period as f64);
+        let rsi = if avg_loss == 0.0 {
+            100.0
+        } else {
+            100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+        };
+        feature_map.insert("rsi".to_string(), rsi);
+
+        // 4. 動態 MA 乖離率 (BIAS) 與 布林 %B
+        // 關鍵功能註解：計算價格偏離動態成本線之比例與通道相對位置
+        let ma = valid_prices.iter().sum::<f64>() / (current_len as f64);
+        let bias = (current_price - ma) / ma;
+        feature_map.insert("bias".to_string(), bias);
+
+        let price_std = (valid_prices.iter().map(|p| (p - ma).powi(2)).sum::<f64>() / (current_len as f64)).sqrt();
+        let upper_band = ma + 2.0 * price_std;
+        let lower_band = ma - 2.0 * price_std;
+        let bollinger_pct_b = if (upper_band - lower_band).abs() < 1e-8 {
+            0.5
+        } else {
+            (current_price - lower_band) / (upper_band - lower_band)
+        };
+        feature_map.insert("bollinger_pct_b".to_string(), bollinger_pct_b);
+
+        symbol_features_map.insert(symbol.clone(), feature_map);
+    }
+
+    Ok(symbol_features_map)
+}
 pub fn align_and_forward_fill(
     raw_klines: &HashMap<String, Vec<KLine>>,
 ) -> AlignedMarketData {
@@ -307,7 +727,8 @@ pub async fn run_analysis(
             .timestamp(),
         None => 946684800,
     };
-    
+      // 階段 1：補資料與資料對齊
+    // ==========================================
     SelectionPipeline::backfill_portfolio_klines(client, db, start_iso_str, &config.timeframe)
         .await
         .map_err(|e| e.to_string())?; 
@@ -324,39 +745,74 @@ pub async fn run_analysis(
             .await?;
         raw_klines_map.insert(target.symbol.clone(), klines);
     }
-
+    //階段2 初步計算歷史對數日報酬率與共變異數矩陣
+    // ==========================================
     let aligned_data = align_and_forward_fill(&raw_klines_map);
     let daily_log_returns = compute_daily_log_returns(&aligned_data);
     let base_stats = compute_base_statistics(&daily_log_returns);
+    let file = File::create("daily_log_returns_data.json").map_err(|e|e.to_string())?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, &daily_log_returns).map_err(|e|e.to_string())?;
+
+
+// ==========================================
+    // 階段 3：實時特徵工程與動態模型 (Feature Engineering & Latent Factor Model)
+    // ==========================================
+
+    // 3.1 純量價特徵與市場熱度 (直接從 aligned_data 計算)
+    // 產出：每檔標的之動量、極端波動與流動性衝擊 (RSI, ATR, Parkinson Vol, Volume Z-Score, Amihud)
+    // 用途：ATR / Volatility 用於風險預算 (Risk Budgeting) 與頭寸縮放，RSI/Volume 用於風控與Timing overlay
+    // 關鍵功能註解：從 aligned_data 提取純量價多維特徵矩陣
+    let tech_features = compute_pure_price_features(&aligned_data,end_ts)
+    .with_context(|| format!("執行 run_analysis 階段 3 失敗 [end_ts: {}, timeframe: {:?}]", end_ts, config.timeframe))
+    .map_err(|e| format!("{:?}", e))?;
     
-    println!("跑完了 去睡覺吧");
+    // 3.2 橫截面 PCA 主成分分析 (替代傳統 Fama-French 因子)
+    // 產出：本地即時 SVD 分解出的隱性市場因子 (PC1 大盤共性, PC2 板塊輪動) 與個股 Alpha 殘差
+    // 用途：完全排除外部財報延遲與黑盒子，100% 零延遲生成客觀的隱性因子與 Alpha 觀點 vector (Q)
+    // 關鍵功能註解：對價格報酬率矩陣執行 PCA 降維並提取個股殘差 Alpha
 
-    // 3.2 因子與歸因分析 (需要載入外部 Fama-French & Rf 數據)
-    // 產出：個股對 Market, SMB, HML 的 Alpha & Factor Betas
-    todo!();//let factor_data = db.load_market_factors_by_range(start_ts, end_ts).await?;
-    todo!();//let factor_analysis = compute_fama_french_regression(&daily_log_returns, &factor_data)?;
-
-    // 3.3 技術指標與市場熱度特徵 (直接從 aligned_data 計算)
-    // 產出：每檔標的的動量與熱度特徵向量 (RSI, MACD, Bollinger Bands, ATR)
-   todo!(); //let tech_features = compute_technical_indicators(&aligned_data);
-
-    // 3.4 時序與動態模型 (條件波動率與協整)
-    // 產出：GARCH 條件波動率預測、資產間 Cointegration 協整檢定矩陣
-    todo!();//let time_series_models = compute_time_series_dynamics(&daily_log_returns)?;
-
+    let latent_factor_analysis = compute_cross_sectional_pca(&daily_log_returns, 3)
+    .with_context(|| "執行 run_analysis 階段 3.2 PCA 隱性因子分解失敗")
+    .map_err(|e| format!("{:?}", e))?;
+    //println!("{:#?}",latent_factor_analysis);
+    // 3.3 時序與動態模型 (條件波動率與協整)
+    // 產出：GARCH-Student-t / DCC-GARCH 動態協方差矩陣 Σ (考慮肥尾與波動聚集)
+    // 用途：替代傳統 Sample Covariance，精準捕捉暴跌時的波動性激增與尾端風險
+    // 關鍵功能註解：擬合動態協方差矩陣以捕捉市場非對稱波動
+    let garch_cov_matrix = compute_factor_garch_cov(&daily_log_returns,&latent_factor_analysis,3)
+    .with_context(|| "執行 run_analysis 階段 3.3 GARCH時序與動態模型失敗")
+    .map_err(|e| format!("{:?}", e))?;
+    //println!("PCA 因子解釋比例: {:#?}", garch_cov_matrix);
 
     // ==========================================
     // 階段 4：理論投資組合建構 (Theoretical Portfolio Optimization)
     // ==========================================
+
     // 4.1 彙整觀點 (Views) 與市場均衡 (CAPM Anchor)
-    // 4.2 Black-Litterman 模型計算 -> 產出理論目標權重 (w_BL) 與期望收益
+    // 將 3.2 算出的 PCA 隱性因子 Alpha 轉換為 Black-Litterman 的觀點向量 Q 與信心矩陣 Ω
+    // 關鍵功能註解：將 PCA 隱性因子 Alpha 轉化為 Black-Litterman 觀點矩陣 (P, Q, Ω)
+    //let bl_views = build_views_from_pca_alpha(&latent_factor_analysis)?;
+
+    // 4.2 Black-Litterman 模型計算 -> 結合 GARCH Σ 與 PCA Alpha Views
+    // 扣除交易摩擦成本 (Alpaca規費 + GARCH動態估算滑點) 進行權重最佳化
+    // 關鍵功能註解：執行 Black-Litterman 最佳化求解，產出理論目標權重 w_BL
+    //let theoretical_weights = run_black_litterman(&base_stats, &garch_cov_matrix, &bl_views)?;
 
 
     // ==========================================
     // 階段 5：幾何路徑與極端風險模擬 (Monte Carlo & Stress Testing)
     // ==========================================
-    // 5.1 對理論組合執行 GBM / Jump-Diffusion 蒙地卡羅模擬 (10,000 次路徑)
-    // 5.2 計算理論 VaR / CVaR 與權益穿透率 (Tail Risk Analysis)
+
+    // 5.1 對理論組合執行 Jump-Diffusion 蒙地卡羅模擬 (10,000 次路徑)
+    // 5.2 計算理論 99% VaR / CVaR 與極端情境穿透率 (Tail Risk Analysis)
+    // 5.3 風控熔斷與技術面 Timing Overlay 修正，產出最終可執行權重 w_target
+    // 關鍵功能註解：執行 10,000 次蒙地卡羅模擬評估尾端風險 (VaR / CVaR)
+    //let mc_results = run_monte_carlo_simulation(&theoretical_weights, &garch_cov_matrix, 10000)?;
+    //let tail_risk = compute_tail_risk(&mc_results);
+
+    // 關鍵功能註解：結合 CVaR 風控預算上限與極端 Z-Score / ATR 斷路器，產出最終目標組合
+    //let final_portfolio = apply_risk_budget_and_timing(&theoretical_weights, &tail_risk, &tech_features);
 
 
     // ==========================================

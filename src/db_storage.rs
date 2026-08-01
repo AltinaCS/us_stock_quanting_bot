@@ -1,12 +1,62 @@
-﻿use chrono::{DateTime, TimeZone, Timelike, Utc, NaiveTime,Datelike,Duration};
+﻿use chrono::{DateTime, TimeZone, Timelike, Utc, NaiveTime,Datelike,Duration,NaiveDate};
 
 use chrono_tz::America::New_York;
 use crate::config;
 use serde::{Deserialize,Serialize};
-use std::collections::{HashMap, BTreeSet,HashSet};
-use sqlx::{any::AnyPoolOptions, AnyPool, Row};
+use std::collections::{HashMap, BTreeSet,HashSet,BTreeMap};
+use sqlx::{any::AnyPoolOptions, PgPool, Row};
 use rust_decimal::{Decimal};
 use uuid::Uuid;
+use std::io::{Cursor, Read};
+use zip::ZipArchive;
+#[derive(Debug, Clone)]
+pub struct FamaFrench6FactorRecord {
+    pub date_str: String, // 格式："YYYY-MM-DD" 對應 Postgres DATE
+    pub mkt_rf: f64,
+    pub smb: f64,
+    pub hml: f64,
+    pub rmw: f64,
+    pub cma: f64,
+    pub mom: f64,
+    pub rf: f64,
+}
+struct FF5Raw {
+    date: NaiveDate,
+    mkt_rf: f64,
+    smb: f64,
+    hml: f64,
+    rmw: f64,
+    cma: f64,
+    rf: f64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactorType {
+    MktRf,
+    Smb,
+    Hml,
+    Rmw,
+    Cma,
+    Mom,
+}
+
+impl FactorType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FactorType::MktRf => "mkt_rf",
+            FactorType::Smb => "smb",
+            FactorType::Hml => "hml",
+            FactorType::Rmw => "rmw",
+            FactorType::Cma => "cma",
+            FactorType::Mom => "mom",
+        }
+    }
+}
+
+pub struct LoadedFactorData {
+    pub dates: Vec<NaiveDate>,
+    pub factor_matrix: Vec<Vec<f64>>, // N 筆交易日 x K 個所選因子
+    pub rf: Vec<f64>,                  // 無風險利率
+}
 #[derive(Debug, Deserialize)]
 pub struct IdleConfigs {
     pub trash_talks: Vec<String>,
@@ -431,7 +481,7 @@ pub struct PortfolioTarget {
     pub status: TargetStatus,
 }
 pub struct MarketDatabase {
-    pool: AnyPool,
+    pool: PgPool,
 }
 impl MarketDatabase {
     // 關鍵功能註解：初始化資料庫並自動建立資料表防呆
@@ -440,7 +490,7 @@ impl MarketDatabase {
         
         let db_url = &*config::DB_URL;
 
-        let pool = AnyPoolOptions::new()
+        let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
             .connect(db_url)
             .await?;
@@ -569,6 +619,20 @@ impl MarketDatabase {
         )
         .execute(&pool)
         .await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS fama_french_6factors_daily (
+                            trading_date DATE PRIMARY KEY,
+                            mkt_rf DOUBLE PRECISION NOT NULL,
+                            smb DOUBLE PRECISION NOT NULL,
+                            hml DOUBLE PRECISION NOT NULL,
+                            rmw DOUBLE PRECISION NOT NULL,
+                            cma DOUBLE PRECISION NOT NULL,
+                            mom DOUBLE PRECISION NOT NULL,
+                            rf DOUBLE PRECISION NOT NULL,
+                            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                        );")
+        .execute(&pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_ff6_date ON fama_french_6factors_daily(trading_date);")
+        .execute(&pool).await?;
     
 
         Ok(Self { pool })
@@ -693,6 +757,214 @@ impl MarketDatabase {
                                                                                                                                                                                
             Ok(assets)                                                                                                                                                         
         }  
+        //因子下載的輔助函式
+     async fn download_and_extract_zip(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let response = client.get(url).send().await?.bytes().await?;
+        let reader = Cursor::new(response);
+        let mut archive = ZipArchive::new(reader)?;
+        let mut file = archive.by_index(0)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    // 關鍵功能註解：解析 Kenneth French 官方 5 因子 CSV 內容
+     fn parse_ff5_csv(csv_content: &str) -> Result<Vec<FF5Raw>, Box<dyn std::error::Error>> {
+        let mut records = Vec::new();
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(csv_content.as_bytes());
+
+        for result in rdr.records() {
+            let record = result?;
+            if let Some(date_str) = record.get(0) {
+                let date_str = date_str.trim();
+                if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(naive_date) = NaiveDate::parse_from_str(date_str, "%Y%m%d") {
+                        records.push(FF5Raw {
+                            date: naive_date,
+                            mkt_rf: record.get(1).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0,
+                            smb: record.get(2).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0,
+                            hml: record.get(3).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0,
+                            rmw: record.get(4).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0,
+                            cma: record.get(5).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0,
+                            rf: record.get(6).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    // 關鍵功能註解：解析 Kenneth French 動量因子 CSV 內容
+     fn parse_mom_csv(csv_content: &str) -> Result<BTreeMap<NaiveDate, f64>, Box<dyn std::error::Error>> {
+        let mut mom_map = BTreeMap::new();
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(csv_content.as_bytes());
+
+        for result in rdr.records() {
+            let record = result?;
+            if let Some(date_str) = record.get(0) {
+                let date_str = date_str.trim();
+                if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(naive_date) = NaiveDate::parse_from_str(date_str, "%Y%m%d") {
+                        let mom = record.get(1).unwrap_or("0").trim().parse::<f64>().unwrap_or(0.0) / 100.0;
+                        mom_map.insert(naive_date, mom);
+                    }
+                }
+            }
+        }
+        Ok(mom_map)
+    }
+
+    // 關鍵功能註解：並行下載 5 因子與動量 Zip 檔並合併為 6 因子資料列
+    pub async fn fetch_fama_french_6_factors_daily(
+        client: &reqwest::Client,
+    ) -> Result<Vec<FamaFrench6FactorRecord>, Box<dyn std::error::Error>> {
+        let base_url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/";
+        let url_5f = format!("{base_url}F-F_Research_Data_5_Factors_2x3_daily_CSV.zip");
+        let url_mom = format!("{base_url}F-F_Momentum_Factor_daily_CSV.zip");
+
+        let (res_5f, res_mom) = tokio::try_join!(
+            Self::download_and_extract_zip(client, &url_5f),
+            Self::download_and_extract_zip(client, &url_mom)
+        )?;
+
+        let ff5_records = Self::parse_ff5_csv(&res_5f)?;
+        let mom_map = Self::parse_mom_csv(&res_mom)?;
+
+        let mut ff6_records = Vec::new();
+        for rec in ff5_records {
+            if let Some(&mom_val) = mom_map.get(&rec.date) {
+                ff6_records.push(FamaFrench6FactorRecord {
+                    date_str: rec.date.to_string(),
+                    mkt_rf: rec.mkt_rf,
+                    smb: rec.smb,
+                    hml: rec.hml,
+                    rmw: rec.rmw,
+                    cma: rec.cma,
+                    mom: mom_val,
+                    rf: rec.rf,
+                });
+            }
+        }
+
+        tracing::info!("成功解析 Kenneth French 6 因子數據，共 {} 筆記錄", ff6_records.len());
+        Ok(ff6_records)
+    }
+    pub async fn save_fama_french_factors(
+        &self,
+    records: &[FamaFrench6FactorRecord],
+    ) -> Result<(), sqlx::Error> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // 分批次寫入 (例如每批 1000 筆) 以防止超過 Postgres 參數數量上限
+        for chunk in records.chunks(1000) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO fama_french_6factors_daily (trading_date, mkt_rf, smb, hml, rmw, cma, mom, rf) "
+            );
+
+            query_builder.push_values(chunk, |mut b, rec| {
+                // 解析字串日期為 chrono::NaiveDate 寫入 Postgres
+                let date = chrono::NaiveDate::parse_from_str(&rec.date_str, "%Y-%m-%d").unwrap();
+                b.push_bind(date)
+                .push_bind(rec.mkt_rf)
+                .push_bind(rec.smb)
+                .push_bind(rec.hml)
+                .push_bind(rec.rmw)
+                .push_bind(rec.cma)
+                .push_bind(rec.mom)
+                .push_bind(rec.rf);
+            });
+
+            // 碰撞處理：若日期已存在，則更新因子值 (Upsert)
+            query_builder.push(
+                " ON CONFLICT (trading_date) DO UPDATE SET "
+            );
+            query_builder.push("mkt_rf = EXCLUDED.mkt_rf, ");
+            query_builder.push("smb = EXCLUDED.smb, ");
+            query_builder.push("hml = EXCLUDED.hml, ");
+            query_builder.push("rmw = EXCLUDED.rmw, ");
+            query_builder.push("cma = EXCLUDED.cma, ");
+            query_builder.push("mom = EXCLUDED.mom, ");
+            query_builder.push("rf = EXCLUDED.rf;");
+
+            let query = query_builder.build();
+            query.execute(&self.pool).await?;
+        }
+
+        println!("✅ 成功將 {} 筆 6 因子記錄同步至 PostgreSQL 喵！", records.len());
+        Ok(())
+    }
+    pub async fn load_fama_french_factors(
+        &self,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        selected_factors: &[FactorType],
+    ) -> Result<LoadedFactorData, sqlx::Error> {
+        if selected_factors.is_empty() {
+            return Ok(LoadedFactorData {
+                dates: vec![],
+                factor_matrix: vec![],
+                rf: vec![],
+            });
+        }
+
+        // 組裝 SQL 欄位字串 (例如："mkt_rf, smb, hml")
+        let factor_cols = selected_factors
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "SELECT trading_date, rf, {} FROM fama_french_6factors_daily \
+             WHERE trading_date >= $1 AND trading_date <= $2 \
+             ORDER BY trading_date ASC;",
+            factor_cols
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(start_date)
+            .bind(end_date)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut dates = Vec::with_capacity(rows.len());
+        let mut rf = Vec::with_capacity(rows.len());
+        let mut factor_matrix = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let date: NaiveDate = row.get("trading_date");
+            let rf_val: f64 = row.get("rf");
+
+            let mut row_factors = Vec::with_capacity(selected_factors.len());
+            for i in 0..selected_factors.len() {
+                // 從索引 2 開始讀取動態選取的因子欄位 (0 為 trading_date, 1 為 rf)
+                let val: f64 = row.get(i + 2);
+                row_factors.push(val);
+            }
+
+            dates.push(date);
+            rf.push(rf_val);
+            factor_matrix.push(row_factors);
+        }
+
+        Ok(LoadedFactorData {
+            dates,
+            factor_matrix,
+            rf,
+        })
+    }
     // 關鍵功能註解：非同步寫入K線數據至本地資料庫
    // 關鍵功能註解：根據 Timeframe 列舉取得對應之資料庫表格名稱
     fn get_table_name(timeframe: &TimeframeConfig) -> &'static str {
@@ -713,25 +985,23 @@ impl MarketDatabase {
 
         let table_name =MarketDatabase::get_table_name(timeframe);
 
-        let mut builder = sqlx::QueryBuilder::<sqlx::Any>::new(format!(
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
         "INSERT INTO {} (asset_id, timestamp, open, high, low, close, volume, session) ",
         table_name
     ));
 
     // 關鍵功能註解：動態展開VALUES綁定並將asset_id顯式轉型為uuid
-    builder.push_values(&klines, |mut b, kline| {
-        let asset_id_str = kline.asset_id.to_string();
-        b.push_bind(asset_id_str)
-         .push_unseparated("::uuid")
-         .push_bind(kline.timestamp)
-         .push_bind(&kline.open)
-         .push_bind(&kline.high)
-         .push_bind(&kline.low)
-         .push_bind(&kline.close)
-         .push_bind(kline.volume)
-         .push_bind(kline.session.to_int());
-    });
-
+    // 關鍵功能註解：使用separated與CAST將字串綁定轉換為資料庫UUID型態
+    builder.push_values(klines.iter(), |mut b, kline| {
+            b.push_bind(kline.asset_id)
+                .push_bind(kline.timestamp)
+                .push_bind(&kline.open)
+                .push_bind(&kline.high)
+                .push_bind(&kline.low)
+                .push_bind(&kline.close)
+                .push_bind(kline.volume)
+                .push_bind(kline.session.to_int());
+        });
     builder.push(
         " ON CONFLICT (asset_id, timestamp) DO UPDATE SET \
          open = EXCLUDED.open, \
@@ -741,7 +1011,6 @@ impl MarketDatabase {
          volume = EXCLUDED.volume, \
          session = EXCLUDED.session"
     );
-
     let result = builder.build().execute(&self.pool).await?;
 
         Ok(result.rows_affected())
