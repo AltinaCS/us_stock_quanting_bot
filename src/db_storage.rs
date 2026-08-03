@@ -4,11 +4,12 @@ use chrono_tz::America::New_York;
 use crate::config;
 use serde::{Deserialize,Serialize};
 use std::collections::{HashMap, BTreeSet,HashSet,BTreeMap};
-use sqlx::{any::AnyPoolOptions, PgPool, Row};
+use sqlx::{any::AnyPoolOptions, PgPool, Row,QueryBuilder,Postgres};
 use rust_decimal::{Decimal};
 use uuid::Uuid;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
+
 #[derive(Debug, Clone)]
 pub struct FamaFrench6FactorRecord {
     pub date_str: String, // 格式："YYYY-MM-DD" 對應 Postgres DATE
@@ -238,7 +239,22 @@ impl AlpacaClient {
 
     Ok(active_assets)
 }
+    pub fn seconds_until_next_market_open() -> u64 {
+    let now_ny = chrono::Utc::now().with_timezone(&chrono_tz::America::New_York);
+    
+    // 關鍵功能註解：計算今天的美東 09:30 開盤點
+    let today_open_naive = now_ny.date_naive().and_hms_opt(9, 30, 0).unwrap();
+    let today_open = chrono_tz::America::New_York.from_local_datetime(&today_open_naive).unwrap();
 
+    // 關鍵功能註解：若已經過了今日開盤或為週末，最長睡 10 秒即重新確認
+    if now_ny >= today_open || now_ny.weekday() == chrono::Weekday::Sat || now_ny.weekday() == chrono::Weekday::Sun {
+        return 10;
+    }
+
+    // 關鍵功能註解：盤前倒數，若距離開盤大於 60 秒則回傳剩餘秒數，否則精準倒數
+    let duration = (today_open - now_ny).num_seconds();
+    if duration > 0 { duration as u64 } else { 1 }
+}
     // 注意 這邊是跟Yahoo Finance請求資料
    pub async fn fetch_price_data(
     client: &reqwest::Client,
@@ -349,17 +365,20 @@ impl AlpacaClient {
     Ok(klines)
 }
     pub fn is_market_window_open() -> bool {
-    let now = Utc::now();
+    let now_utc = chrono::Utc::now();
+    // 關鍵功能註解：轉換為美東時間以自動適應夏令與冬令時制
+    let now_ny = now_utc.with_timezone(&chrono_tz::America::New_York);
     
-    // 關鍵功能註解：第一層過濾，週末（週六、週日）美股絕對休市
-    if now.weekday() == chrono::Weekday::Sat || now.weekday() == chrono::Weekday::Sun {
+    // 關鍵功能註解：第一層過濾，美東時間週末絕對休市
+    if now_ny.weekday() == chrono::Weekday::Sat || now_ny.weekday() == chrono::Weekday::Sun {
         return false;
     }
-    
-    // 關鍵功能註解：第二層過濾，可限制在美股盤前至盤後交易時段內才放行 (UTC時間對齊)
-    // 這裡可以依據你的策略需求（是否跑盤前外盤）動態調整小時區間
-    let hour = now.hour();
-    hour >= 8 && hour <= 22
+
+    // 關鍵功能註解：美股常規交易時段為美東時間 09:30 至 16:00
+    let time_in_minutes = now_ny.hour() * 60 + now_ny.minute();
+
+    // 09:30 = 570 分鐘，16:00 = 960 分鐘
+    time_in_minutes >= 570 && time_in_minutes < 960
 }
 }
 
@@ -481,7 +500,7 @@ pub struct PortfolioTarget {
     pub status: TargetStatus,
 }
 pub struct MarketDatabase {
-    pool: PgPool,
+    pub pool: PgPool,
 }
 impl MarketDatabase {
     // 關鍵功能註解：初始化資料庫並自動建立資料表防呆
@@ -592,8 +611,9 @@ impl MarketDatabase {
             selected_at BIGINT NOT NULL,
             status target_status_enum NOT NULL,
             CONSTRAINT fk_portfolio_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
+            weight_updated_at BIGINT, 
         );"
-        ).execute(&pool).await?;
+        ).execute(&pool).await?; 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS positions (
                 asset_id UUID PRIMARY KEY,
@@ -1191,6 +1211,7 @@ impl MarketDatabase {
                                                                                                                                                                   
             Ok(targets)                                                                                                                                           
         }
+    
     pub async fn get_latest_asset_updated_at(&self) -> Result<Option<i64>, String> {
         let row = sqlx::query("SELECT updated_at FROM assets ORDER BY updated_at DESC LIMIT 1")
         .fetch_optional(&self.pool)
@@ -1386,5 +1407,115 @@ impl MarketDatabase {
 
     // 關鍵功能註解：將數據密度結果正式列入判定
     Ok(has_valid_start && has_valid_end && has_sufficient_density)
+}
+pub async fn check_and_get_weights(
+    &self,
+    market_open_timestamp: i64, // 今日開盤的秒級 Unix Timestamp
+) -> Result<Option<HashMap<String, Decimal>>, String> {
+    // 關鍵功能註解：查詢當前目標權重與最後更新時間戳
+    let rows: Vec<(String, Decimal, Option<i64>)> = sqlx::query_as(
+        "SELECT symbol, weight, weight_updated_at FROM portfolio_targets WHERE status = 'active'"
+    )
+    .fetch_all(&self.pool)
+    .await
+    .map_err(|e| format!("讀取目標權重失敗: {}", e))?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    // 關鍵功能註解：檢查是否有任何紀錄的 weight_updated_at 為 NULL 或早於今日開盤
+    let is_stale = rows.iter().any(|(_, _, updated_at)| {
+        match updated_at {
+            Some(ts) => *ts < market_open_timestamp,
+            None => true, // 為 NULL 視為無效/未更新，需重算
+        }
+    });
+
+    if is_stale {
+        return Ok(None); // 觸發重新計算初始權重
+    }
+
+    let weights_map = rows.into_iter().map(|(s, w, _)| (s, w)).collect();
+    Ok(Some(weights_map))
+}
+pub async fn save_portfolio_weights(
+    &self,
+    target_decimal_weights: &HashMap<String, Decimal>,
+    ) -> Result<usize, String> {
+    if target_decimal_weights.is_empty() {
+        return Ok(0);
+    }
+
+    // 關鍵功能註解：提取所有 Symbol 進行資產字典檔批次查詢
+    let symbols: Vec<String> = target_decimal_weights.keys().cloned().collect();
+
+    // 關鍵功能註解：透過 Symbol 批次查詢對應的 asset_id
+    let rows = sqlx::query(
+        "SELECT symbol, id FROM assets WHERE symbol = ANY($1)"
+    )
+    .bind(&symbols)
+    .fetch_all(&self.pool)
+    .await
+    .map_err(|e| format!("查詢 asset_id 失敗: {}", e))?;
+
+    let symbol_to_id: HashMap<String, uuid::Uuid> = rows
+        .into_iter()
+        .map(|row| (row.get("symbol"), row.get("id")))
+        .collect();
+
+    // 關鍵功能註解：取得當前秒級 Unix 時間戳 (i64)
+    let current_timestamp = chrono::Utc::now().timestamp();
+
+    // 關鍵功能註解：篩選出有效資產與對應權重的配對向量
+    let valid_pairs: Vec<(uuid::Uuid, Decimal)> = target_decimal_weights
+        .iter()
+        .filter_map(|(s, w)| symbol_to_id.get(s).map(|id| (*id, *w)))
+        .collect();
+
+    if valid_pairs.is_empty() {
+        return Ok(0);
+    }
+
+    // 關鍵功能註解：使用 QueryBuilder 搭配 push_tuples 構建批次 UPDATE 語句並同步更新 weight_updated_at
+    let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+        "UPDATE portfolio_targets AS pt SET weight = val.weight, FROMweight_updated_at = "
+    );
+    
+    builder.push_bind(current_timestamp);
+    builder.push(" FROM (");
+
+    builder.push_values(valid_pairs, |mut b, (asset_id, weight)| {
+        b.push_bind(asset_id).push_bind(weight);
+    });
+
+    builder.push(") AS val(asset_id, weight) WHERE pt.asset_id = val.asset_id");
+
+    // 關鍵功能註解：執行 QueryBuilder 產生的批次更新指令
+    let result = builder
+        .build()
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("批次更新權重失敗: {}", e))?;
+
+    Ok(result.rows_affected() as usize)
+    }
+    pub async fn should_recalculate_weights(
+    &self,
+    market_open_timestamp: i64, // 今日開盤的 Unix Timestamp (秒)
+) -> Result<bool, String> {
+    // 關鍵功能註解：查詢資料庫中 active 狀態資產的最小權重更新時間戳
+    let row: (Option<i64>,) = sqlx::query_as(
+        "SELECT MIN(weight_updated_at) FROM portfolio_targets WHERE status = 'active'"
+    )
+    .fetch_one(&self.pool)
+    .await
+    .map_err(|e| format!("讀取權重時間戳失敗: {}", e))?;
+
+    match row.0 {
+        // 關鍵功能註解：若時間戳為 NULL 或早於今日開盤秒數，判定需要重算
+        Some(min_updated_at) => Ok(min_updated_at < market_open_timestamp),
+        None => Ok(true),
+    }
 }
 }

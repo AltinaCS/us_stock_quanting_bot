@@ -1,6 +1,9 @@
 ﻿use std::collections::{BTreeMap,BTreeSet,HashMap};
 use chrono::{DateTime, Utc,NaiveDate};
+use serde::Deserialize;
 use serde::Serialize;
+use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use crate::{db_storage::{MarketDatabase, TimeframeConfig,TargetType,KLine}, selector::SelectionPipeline};
 use tracing::warn;
 use std::time::Instant;
@@ -11,6 +14,19 @@ use ndarray::{Array1, Array2, Axis};
 use nalgebra::{DMatrix, DVector};
 use std::fs::File;
 use std::io::BufWriter;
+#[derive(Debug, Clone)]
+pub struct BlackLittermanViews {
+    pub p_matrix: Array2<f64>, // N x N 單位矩陣
+    pub q_vector: Array1<f64>, // N x 1 觀點向量 (PCA Alpha 殘差)
+    pub omega_matrix: Array2<f64>, // N x N 觀點不確定性對角矩陣
+}
+#[derive(Debug, Clone)]
+pub struct BlackLittermanResult {
+    pub expected_returns: HashMap<String, f64>,
+    pub target_weights: HashMap<String, f64>,
+}
+// 關鍵功能註解：將 PCA 隱性因子 Alpha 轉化為 Black-Litterman 觀點矩陣 (P, Q, Ω)
+
 #[derive(Debug, Clone,Serialize)]
 pub struct DailyLogReturns {
     pub timestamps: Vec<i64>,
@@ -55,12 +71,12 @@ pub struct DailyPriceSnapshot {
 }
 
 /// 關鍵功能註解：純統計分析結果輸出容器
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone,Serialize,Deserialize)]
 pub struct AnalysisResult {
-    pub total_days: usize,
-    pub covariance_matrix: Vec<Vec<f64>>,
-    pub beta_map: BTreeMap<String, f64>,
-    pub rolling_volatility: BTreeMap<String, f64>,
+   pub start_ts: i64, //統計起始時間
+   pub end_ts: i64,   //統計終止時間
+   pub weights: HashMap<String, Decimal>,
+   pub features: HashMap<String, HashMap<String, f64>>
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +97,145 @@ impl Default for AnalysisConfig {
             timeframe: TimeframeConfig::OneDay,
         }
     }
+}
+pub fn build_views_from_pca_alpha(
+    latent_result: &LatentFactorResult,
+    tech_features: &HashMap<String, HashMap<String, f64>>,
+    symbols: &[String],
+    garch_cov: &HashMap<String, HashMap<String, f64>>,
+    tau: f64,
+) -> Result<BlackLittermanViews> {
+    let n = symbols.len();
+    if n == 0 {
+        return Err(anyhow!("資產列表為空，無法構建 BL 觀點"));
+    }
+
+    let p_matrix = Array2::eye(n);
+    let mut q_vector = Array1::zeros(n);
+    let mut omega_matrix = Array2::zeros((n, n));
+
+    for (i, symbol) in symbols.iter().enumerate() {
+        let raw_alpha = latent_result
+            .alpha_residuals
+            .get(symbol)
+            .cloned()
+            .unwrap_or(0.0);
+
+        let var_i = garch_cov
+            .get(symbol)
+            .and_then(|row| row.get(symbol))
+            .cloned()
+            .unwrap_or(0.0001);
+
+        let mut multiplier = 1.0;
+        let mut uncertainty_scaler = 1.0;
+
+        if let Some(feats) = tech_features.get(symbol) {
+            let rsi = feats.get("rsi_14").cloned().unwrap_or(50.0);
+            let amihud = feats.get("amihud_illiquidity").cloned().unwrap_or(0.0);
+
+            if rsi > 70.0 && raw_alpha > 0.0 {
+                multiplier *= 0.5;
+            }
+            if amihud > 0.001 {
+                uncertainty_scaler *= 1.5;
+            }
+        }
+
+        q_vector[i] = raw_alpha * multiplier;
+        omega_matrix[[i, i]] = (tau * var_i * uncertainty_scaler).max(1e-8);
+    }
+
+    Ok(BlackLittermanViews {
+        p_matrix,
+        q_vector,
+        omega_matrix,
+    })
+}
+
+// 關鍵功能註解：執行 Black-Litterman 最佳化求解，產出理論目標權重 w_BL
+pub fn run_black_litterman(
+    symbols: &[String],
+    garch_cov: &HashMap<String, HashMap<String, f64>>,
+    views: &BlackLittermanViews,
+    tau: f64,
+    risk_aversion: f64,
+) -> Result<BlackLittermanResult> {
+    let n = symbols.len();
+    if n == 0 {
+        return Err(anyhow!("資產列表為空，無法執行 Black-Litterman"));
+    }
+
+    let mut cov_arr = Array2::zeros((n, n));
+    for (i, sym_i) in symbols.iter().enumerate() {
+        for (j, sym_j) in symbols.iter().enumerate() {
+            cov_arr[[i, j]] = garch_cov
+                .get(sym_i)
+                .and_then(|row| row.get(sym_j))
+                .cloned()
+                .unwrap_or(0.0);
+        }
+    }
+
+    let w_mkt = Array1::from_elem(n, 1.0 / (n as f64));
+    let pi = risk_aversion * cov_arr.dot(&w_mkt);
+
+    let cov_inv = symmetric_eigen(&cov_arr)
+        .map(|(vals, vecs)| {
+            let mut inv_diag = Array2::zeros((n, n));
+            for k in 0..n {
+                let val = if vals[k] > 1e-8 { 1.0 / vals[k] } else { 0.0 };
+                inv_diag[[k, k]] = val;
+            }
+            vecs.dot(&inv_diag).dot(&vecs.t())
+        })
+        .unwrap_or_else(|_| Array2::eye(n));
+
+    let mut omega_inv = Array2::zeros((n, n));
+    for i in 0..n {
+        let val = views.omega_matrix[[i, i]];
+        omega_inv[[i, i]] = if val > 1e-8 { 1.0 / val } else { 0.0 };
+    }
+
+    let tau_cov_inv = &cov_inv / tau;
+    let middle_inv = &tau_cov_inv + &omega_inv;
+
+    let middle_inv_solved = symmetric_eigen(&middle_inv)
+        .map(|(vals, vecs)| {
+            let mut inv_diag = Array2::zeros((n, n));
+            for k in 0..n {
+                let val = if vals[k] > 1e-8 { 1.0 / vals[k] } else { 0.0 };
+                inv_diag[[k, k]] = val;
+            }
+            vecs.dot(&inv_diag).dot(&vecs.t())
+        })
+        .unwrap_or_else(|_| Array2::eye(n));
+
+    let right_term = tau_cov_inv.dot(&pi) + omega_inv.dot(&views.q_vector);
+    let mu_bl = middle_inv_solved.dot(&right_term);
+
+    let raw_w_bl = (1.0 / risk_aversion) * cov_inv.dot(&mu_bl);
+
+    let mut clipped_w = raw_w_bl.mapv(|x| x.max(0.0));
+    let sum_w: f64 = clipped_w.sum();
+    if sum_w > 0.0 {
+        clipped_w /= sum_w;
+    } else {
+        clipped_w = w_mkt;
+    }
+
+    let mut expected_returns = HashMap::new();
+    let mut target_weights = HashMap::new();
+
+    for (i, symbol) in symbols.iter().enumerate() {
+        expected_returns.insert(symbol.clone(), mu_bl[i]);
+        target_weights.insert(symbol.clone(), clipped_w[i]);
+    }
+
+    Ok(BlackLittermanResult {
+        expected_returns,
+        target_weights,
+    })
 }
 fn fit_garch11(returns: &[f64]) -> GarchResult {
     let omega = 0.000005;
@@ -711,12 +866,85 @@ pub async fn verify_klines_integrity(
 
     Ok(symbol_stats)
 }
+pub fn apply_risk_overlay_and_convert(
+    bl_weights: &HashMap<String, f64>,
+    tech_features: &HashMap<String, HashMap<String, f64>>,
+    scale: u32,
+    min_weight_threshold: f64,
+) -> HashMap<String, Decimal> {
+    let mut scaled_weights = HashMap::new();
+    let mut total_f64_weight = 0.0;
+
+    for (symbol, &w) in bl_weights {
+        if w <= 0.0 {
+            scaled_weights.insert(symbol.clone(), 0.0);
+            continue;
+        }
+
+        let mut scale_factor = 1.0;
+        if let Some(feats) = tech_features.get(symbol) {
+            let atr = feats.get("atr_14").cloned().unwrap_or(0.0);
+            if atr > 0.05 {
+                scale_factor *= 0.8;
+            }
+        }
+
+        let final_w = w * scale_factor;
+        scaled_weights.insert(symbol.clone(), final_w);
+        total_f64_weight += final_w;
+    }
+
+    let mut decimal_weights = HashMap::new();
+    let mut total_decimal_sum = Decimal::ZERO;
+    let mut max_symbol: Option<String> = None;
+    let mut max_weight = Decimal::ZERO;
+
+    for (symbol, &w) in &scaled_weights {
+        let normalized_w = if total_f64_weight > 0.0 { w / total_f64_weight } else { 0.0 };
+
+        if normalized_w < min_weight_threshold {
+            decimal_weights.insert(symbol.clone(), Decimal::ZERO);
+            continue;
+        }
+
+        if let Some(dec) = Decimal::from_f64_retain(normalized_w) {
+            let rounded = dec.round_dp(scale);
+            if rounded > max_weight {
+                max_weight = rounded;
+                max_symbol = Some(symbol.clone());
+            }
+            total_decimal_sum += rounded;
+            decimal_weights.insert(symbol.clone(), rounded);
+        } else {
+            decimal_weights.insert(symbol.clone(), Decimal::ZERO);
+        }
+    }
+
+    let target_sum = Decimal::ONE;
+    if total_decimal_sum > Decimal::ZERO && total_decimal_sum != target_sum {
+        let diff = target_sum - total_decimal_sum;
+        if let Some(symbol) = max_symbol {
+            if let Some(w) = decimal_weights.get_mut(&symbol) {
+                *w += diff;
+            }
+        }
+    }
+    let final_sum: Decimal = decimal_weights.values().sum();
+    assert_eq!(
+        final_sum,
+        Decimal::ONE,
+        "權重總和校正失敗，當前總和為: {}",
+        final_sum
+    );
+    decimal_weights
+}
 
 pub async fn run_analysis(
     client: &reqwest::Client,
     db: &MarketDatabase,
     _symbols: &[String],
-    config: &AnalysisConfig
+    config: &AnalysisConfig,
+    save_to_db: bool
 ) -> Result<AnalysisResult, String> {
     let end_ts = config.as_of_ts.unwrap_or_else(|| Utc::now().timestamp());
     let start_iso_str = config.start_iso.as_deref();
@@ -763,10 +991,9 @@ pub async fn run_analysis(
     // 產出：每檔標的之動量、極端波動與流動性衝擊 (RSI, ATR, Parkinson Vol, Volume Z-Score, Amihud)
     // 用途：ATR / Volatility 用於風險預算 (Risk Budgeting) 與頭寸縮放，RSI/Volume 用於風控與Timing overlay
     // 關鍵功能註解：從 aligned_data 提取純量價多維特徵矩陣
-    let tech_features = compute_pure_price_features(&aligned_data,end_ts)
+    let tech_features: HashMap<String, HashMap<String, f64>> = compute_pure_price_features(&aligned_data,end_ts)
     .with_context(|| format!("執行 run_analysis 階段 3 失敗 [end_ts: {}, timeframe: {:?}]", end_ts, config.timeframe))
     .map_err(|e| format!("{:?}", e))?;
-    
     // 3.2 橫截面 PCA 主成分分析 (替代傳統 Fama-French 因子)
     // 產出：本地即時 SVD 分解出的隱性市場因子 (PC1 大盤共性, PC2 板塊輪動) 與個股 Alpha 殘差
     // 用途：完全排除外部財報延遲與黑盒子，100% 零延遲生成客觀的隱性因子與 Alpha 觀點 vector (Q)
@@ -789,19 +1016,29 @@ pub async fn run_analysis(
     // 階段 4：理論投資組合建構 (Theoretical Portfolio Optimization)
     // ==========================================
 
-    // 4.1 彙整觀點 (Views) 與市場均衡 (CAPM Anchor)
-    // 將 3.2 算出的 PCA 隱性因子 Alpha 轉換為 Black-Litterman 的觀點向量 Q 與信心矩陣 Ω
-    // 關鍵功能註解：將 PCA 隱性因子 Alpha 轉化為 Black-Litterman 觀點矩陣 (P, Q, Ω)
-    //let bl_views = build_views_from_pca_alpha(&latent_factor_analysis)?;
+    let symbols: Vec<String> = daily_log_returns.returns.keys().cloned().collect();
+    let tau = 0.025; // Tau 參數預設 0.025
+    let risk_aversion = 2.5; // 風險趨避係數 Gamma 預設 2.5
 
-    // 4.2 Black-Litterman 模型計算 -> 結合 GARCH Σ 與 PCA Alpha Views
-    // 扣除交易摩擦成本 (Alpaca規費 + GARCH動態估算滑點) 進行權重最佳化
-    // 關鍵功能註解：執行 Black-Litterman 最佳化求解，產出理論目標權重 w_BL
-    //let theoretical_weights = run_black_litterman(&base_stats, &garch_cov_matrix, &bl_views)?;
+    // 4.1 彙整觀點 (Views) 與市場均衡
+    let bl_views = build_views_from_pca_alpha(&latent_factor_analysis, &tech_features, &symbols, &garch_cov_matrix, tau)
+        .with_context(|| "執行 run_analysis 階段 4.1 構建 BL 觀點矩陣失敗")
+        .map_err(|e| format!("{:?}", e))?;
 
+    // 4.2 Black-Litterman 模型計算
+    let bl_result = run_black_litterman(&symbols, &garch_cov_matrix, &bl_views, tau, risk_aversion)
+        .with_context(|| "執行 run_analysis 階段 4.2 Black-Litterman 求解失敗")
+        .map_err(|e| format!("{:?}", e))?;
 
+    // 4.3 風控與動態 Overlay 縮放
+    let target_decimal_weights: HashMap<String, Decimal> = apply_risk_overlay_and_convert(
+        &bl_result.target_weights,
+        &tech_features,
+        8,      // 保留 8 位小數
+        0.0001, // 低於 0.01% 的微小頭寸過濾
+    );
     // ==========================================
-    // 階段 5：幾何路徑與極端風險模擬 (Monte Carlo & Stress Testing)
+    // 階段 5：幾何路徑與極端風險模擬 (Monte Carlo & Stress Testing) (這部分會開新的thread 然後暫時先不處理)
     // ==========================================
 
     // 5.1 對理論組合執行 Jump-Diffusion 蒙地卡羅模擬 (10,000 次路徑)
@@ -819,11 +1056,17 @@ pub async fn run_analysis(
     // 產出最終分析結果打包 (Analysis Result Output)
     // ==========================================
     // 提供給非交易時段分析報告，以及對接實盤風控模組做校準與對比
+    //TODO：
+    if save_to_db{
+        db.save_portfolio_weights(&target_decimal_weights).await?;
+        println!("[DB] 成功存入當日開盤基準權重與分析數據");
+    }
     
-    Ok(AnalysisResult {
-        total_days: 0,
-        covariance_matrix: vec![],
-        beta_map: BTreeMap::new(),
-        rolling_volatility: BTreeMap::new(),
-    })
+    Ok(AnalysisResult{
+        start_ts:start_ts,
+        end_ts:end_ts,
+        features:tech_features,
+        weights:target_decimal_weights,
+    }
+    )
 }
