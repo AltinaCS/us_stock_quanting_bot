@@ -8,3 +8,4 @@ TODO
 assets_cache.json
 localhost.session.sql
 daily_log_returns_data.json
+/logs

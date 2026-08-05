@@ -30,3 +30,7 @@ pub static CACHE_RETENTION_DAYS: LazyLock<i64> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())                                                                                                                         
         .unwrap_or(90)                                                                                                                                        
 });
+pub static LOG_LEVEL: LazyLock<String> = LazyLock::new(|| {                                                                                           
+    let _ = dotenvy::dotenv();                                                                                                                                
+    std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".to_string())                                                                                                                                     
+});

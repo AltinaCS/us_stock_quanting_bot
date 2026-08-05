@@ -1,4 +1,4 @@
-﻿use rust_decimal_macros::dec;
+use rust_decimal_macros::dec;
 use rust_decimal;
 use rust_decimal::Decimal;
 use serde::{Serialize,Deserialize};
@@ -83,7 +83,7 @@ pub async fn place_order(
     mut tif: TimeInForce,
     method: OrderMethod,
     extended_hours: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> anyhow::Result<String> {
     
     // 註解：依據輸入類型解構出API需要的類型與價格
     let (mut order_type, limit_price) = match order_type_input {
@@ -146,7 +146,7 @@ pub async fn place_order(
     
     Ok(order_id)
 }
-pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> anyhow::Result<()> {
     // 根據是否有ID決定URL，None就是撈取全部掛單
     let url = match order_id {
         Some(id) => format!("{}/v2/orders/{}", &*config::BASE_URL, id),
@@ -167,7 +167,7 @@ pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Res
 }
 
 // 關鍵功能：支援取消單筆或全選取消所有掛單
-pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> anyhow::Result<()> {
     // None時直接對/v2/orders發射DELETE就是大清空
     let url = match order_id {
         Some(id) => format!("{}/v2/orders/{}", &*config::BASE_URL, id),
@@ -194,7 +194,7 @@ pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> 
 // 關鍵功能：向 Alpaca 請求當前所有持倉的非同步函式
 pub async fn get_positions(
     client: &reqwest::Client,
-) -> Result<Vec<Position>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Vec<Position>> {
     let url = format!("{}/v2/positions", &*config::BASE_URL);
 
     // 1. 發送 GET 請求獲取持倉列表
@@ -208,7 +208,7 @@ pub async fn get_positions(
     // 2. 處理錯誤狀態碼
     if !response.status().is_success() {
         let err_text = response.text().await?;
-        return Err(format!("獲取持倉失敗: {}", err_text).into());
+        return Err(anyhow::anyhow!("獲取持倉失敗: {}", err_text));
     }
 
     // 3. 直接反序列化成高精度的 Vec<Position> 向量
@@ -218,7 +218,7 @@ pub async fn get_positions(
 }
 pub async fn get_account(
     client: &reqwest::Client,
-) -> Result<Account, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Account> {
     let url = format!("{}/v2/account", &*config::BASE_URL);
 
     let response = client
@@ -230,7 +230,7 @@ pub async fn get_account(
    
     if !response.status().is_success() {
         let err_text = response.text().await?;
-        return Err(format!("獲取帳戶失敗: {}", err_text).into());
+        return Err(anyhow::anyhow!("獲取帳戶失敗: {}", err_text));
     }
 
     let account: Account = response.json().await?;

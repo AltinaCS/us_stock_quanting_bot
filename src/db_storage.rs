@@ -1,5 +1,5 @@
 ﻿use chrono::{DateTime, TimeZone, Timelike, Utc, NaiveTime,Datelike,Duration,NaiveDate};
-
+use tracing::{debug, error, info, warn};
 use chrono_tz::America::New_York;
 use crate::config;
 use serde::{Deserialize,Serialize};
@@ -183,12 +183,12 @@ impl AlpacaClient {
     pub async fn get_assets(
     client: &reqwest::Client,
     db: &MarketDatabase,
-) -> Result<Vec<AlpacaAsset>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Vec<AlpacaAsset>> {
     // 關鍵功能註解：比對最新 updated_at 秒數，計算是否已超過 90 天
-    let last_updated = db.get_latest_asset_updated_at().await?;
+    let last_updated = db.get_latest_asset_updated_at().await.map_err(|e| anyhow::anyhow!(e))?;
     let now_secs = chrono::Utc::now().timestamp();
     let three_months_secs = 90 * 24 * 3600;
-    println!("成功抓取上次更新日");
+    info!("成功抓取上次更新日");
     let is_expired = match last_updated {
         Some(updated_at) => (now_secs - updated_at) >= three_months_secs,
         None => true,
@@ -196,15 +196,15 @@ impl AlpacaClient {
 
     // 關鍵功能註解：未過期則直接載入 DB 資料，跳過 API 請求
     if !is_expired {
-        let cached_assets = db.load_assets().await?;
+        let cached_assets = db.load_assets().await.map_err(|e| anyhow::anyhow!(e))?;
         if !cached_assets.is_empty() {
-            println!("[系統通知] 從資料庫載入快取的資產清單 (未滿 3 個月)");
+            info!("[系統通知] 從資料庫載入快取的資產清單 (未滿 3 個月)");
             return Ok(cached_assets);
         }
     }
 
     // 關鍵功能註解：快取不存在或已過期，重新發起 Alpaca API 抓取
-    println!("[系統通知] 資產快取過期或不存在，發起 Alpaca API 請求...");
+    info!("[系統通知] 資產快取過期或不存在，發起 Alpaca API 請求...");
     let url = format!("{}/v2/assets", &*config::BASE_URL);
     let response = client
         .get(&url)
@@ -215,7 +215,7 @@ impl AlpacaClient {
     
     if !response.status().is_success() {
         let err_text = response.text().await?;
-        return Err(format!("獲取資產表失敗: {}", err_text).into());
+        return Err(anyhow::anyhow!("獲取資產表失敗: {}", err_text));
     }
 
     let pb = indicatif::ProgressBar::new_spinner();
@@ -234,7 +234,7 @@ impl AlpacaClient {
         .collect();
 
     // 關鍵功能註解：寫入或更新 DB 並呈現寫入筆數
-    let saved_count = db.save_assets(&active_assets).await?;
+    let saved_count = db.save_assets(&active_assets).await.map_err(|e| anyhow::anyhow!(e))?;
     pb.finish_with_message(format!("[系統通知] 已更新並存入 {} 筆資產至資料庫", saved_count));
 
     Ok(active_assets)
@@ -263,7 +263,7 @@ impl AlpacaClient {
     timeframe: &TimeframeConfig,
     start_iso: Option<&str>, 
     end_iso: Option<&str>,
-) -> Result<Vec<KLine>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Vec<KLine>> {
     let now = Utc::now();
 
     // 關鍵功能註解：根據時間週期解析並處理預設之時間邊界
@@ -272,7 +272,7 @@ impl AlpacaClient {
         TimeframeConfig::OneDay => {
             let mut end = match end_iso {
                 Some(e) => DateTime::parse_from_rfc3339(e)
-                    .map_err(|_| format!("end_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", e))?
+                    .map_err(|_| anyhow::anyhow!("end_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", e))?
                     .with_timezone(&Utc),
                 None => now,
             };
@@ -282,17 +282,17 @@ impl AlpacaClient {
 
             let start = match start_iso {
                 Some(s) => DateTime::parse_from_rfc3339(s)
-                    .map_err(|_| format!("start_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", s))?
+                    .map_err(|_| anyhow::anyhow!("start_iso 時間格式錯誤: '{}'，請使用 RFC3339 格式", s))?
                     .with_timezone(&Utc),
                 None => now - Duration::days(365 * 5),
             };
 
             if start > end {
-                return Err(format!(
+                return Err(anyhow::anyhow!(
                     "時間邏輯錯誤：起始時間 ({}) 不能晚於結束時間 ({}) 喵！",
                     start.to_rfc3339(),
                     end.to_rfc3339()
-                ).into());
+                ));
             }
 
             (start, end, "1d")
@@ -316,15 +316,15 @@ impl AlpacaClient {
 
     if !response.status().is_success() {
         let err_text = response.text().await?;
-        return Err(format!("API 請求失敗: {}", err_text).into());
+        return Err(anyhow::anyhow!("API 請求失敗: {}", err_text));
     }
 
     let text = response.text().await?;
 
     // 關鍵功能註解：嘗試將 Yahoo 原始 JSON 解析並印出詳細偵錯訊息
     let parsed: YahooResponse = serde_json::from_str(&text).map_err(|e| {
-        println!("偵錯 - 標的: {}, 解析失敗原因: {}", symbol, e);
-        println!("偵錯 - 原始 API 回應內容: {}", text);
+        error!("偵錯 - 標的: {}, 解析失敗原因: {}", symbol, e);
+        error!("偵錯 - 原始 API 回應內容: {}", text);
         e
     })?;
 
@@ -499,12 +499,13 @@ pub struct PortfolioTarget {
     pub selected_at: i64,
     pub status: TargetStatus,
 }
+#[derive(Clone)]
 pub struct MarketDatabase {
     pub pool: PgPool,
 }
 impl MarketDatabase {
     // 關鍵功能註解：初始化資料庫並自動建立資料表防呆
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new() -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
         
         let db_url = &*config::DB_URL;
@@ -610,10 +611,11 @@ impl MarketDatabase {
             target_type target_type_enum NOT NULL,
             selected_at BIGINT NOT NULL,
             status target_status_enum NOT NULL,
-            CONSTRAINT fk_portfolio_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE
-            weight_updated_at BIGINT, 
+            CONSTRAINT fk_portfolio_asset FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE RESTRICT ON UPDATE CASCADE,
+            weight_updated_at BIGINT 
         );"
         ).execute(&pool).await?; 
+        
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS positions (
                 asset_id UUID PRIMARY KEY,
@@ -658,7 +660,7 @@ impl MarketDatabase {
         Ok(Self { pool })
     }
     //TODO:還沒找資料源
-     pub async fn fetch_sp500_symbols(client: &reqwest::Client) -> Result<Vec<String>, Box<dyn std::error::Error>> {                                                            
+     pub async fn fetch_sp500_symbols(client: &reqwest::Client)  -> anyhow::Result<Vec<String>> {                                                            
         let url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv";                                                               
         let resp = client.get(url).send().await?.text().await?;                                                                                                                
         let mut symbols = Vec::new();                                                                                                                                          
@@ -676,7 +678,7 @@ impl MarketDatabase {
     pub async fn sync_sp500_constituents(                                                                                                                                  
             &self,                                                                                                                                                             
             raw_symbols: &[String],                                                                                                                                            
-        ) -> Result<(), Box<dyn std::error::Error>> {                                                                                                                          
+        ) -> anyhow::Result<()> {                                                                                                                          
             let now = chrono::Utc::now().timestamp();                                                                                                                          
                                                                                                                                                                                
             // 1. 符號規範化：產生原始符號與連字號轉置符號                                                                                                                     
@@ -720,7 +722,7 @@ impl MarketDatabase {
             }                                                                                                                                                                  
                                                                                                                                                                                
             let rows_affected = query.execute(&self.pool).await?.rows_affected();                                                                                              
-            println!("[S&P500 同步] 成功對齊並更新 {} 檔成分股至資料庫", rows_affected);                                                                                       
+            info!("[S&P500 同步] 成功對齊並更新 {} 檔成分股至資料庫", rows_affected);                                                                                       
                                                                                                                                                                                
             // 關鍵功能註解：讀取資料庫對齊標的並進行防呆比對                                                                                                                  
             let matched_rows = sqlx::query("SELECT symbol FROM sp500_constituents")                                                                                            
@@ -741,7 +743,7 @@ impl MarketDatabase {
                 .collect();                                                                                                                                                    
                                                                                                                                                                                
             if !missing.is_empty() {                                                                                                                                           
-                println!("[S&P500 告警] 共有 {} 檔標的未在 assets 主檔中對齊: {:?}", missing.len(), missing);                                                                  
+                warn!("[S&P500 告警] 共有 {} 檔標的未在 assets 主檔中對齊: {:?}", missing.len(), missing);                                                                  
             }                                                                                                                                                                  
                                                                                                                                                                                
             Ok(())                                                                                                                                                             
@@ -777,11 +779,11 @@ impl MarketDatabase {
                                                                                                                                                                                
             Ok(assets)                                                                                                                                                         
         }  
-        //因子下載的輔助函式
+        //因子下載的輔助函式 暫時用不到
      async fn download_and_extract_zip(
         client: &reqwest::Client,
         url: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<String> {
         let response = client.get(url).send().await?.bytes().await?;
         let reader = Cursor::new(response);
         let mut archive = ZipArchive::new(reader)?;
@@ -791,8 +793,8 @@ impl MarketDatabase {
         Ok(content)
     }
 
-    // 關鍵功能註解：解析 Kenneth French 官方 5 因子 CSV 內容
-     fn parse_ff5_csv(csv_content: &str) -> Result<Vec<FF5Raw>, Box<dyn std::error::Error>> {
+    // 關鍵功能註解：解析 Kenneth French 官方 5 因子 CSV 內容 暫時用不到
+     fn parse_ff5_csv(csv_content: &str) -> anyhow::Result<Vec<FF5Raw>> {
         let mut records = Vec::new();
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
@@ -821,8 +823,8 @@ impl MarketDatabase {
         Ok(records)
     }
 
-    // 關鍵功能註解：解析 Kenneth French 動量因子 CSV 內容
-     fn parse_mom_csv(csv_content: &str) -> Result<BTreeMap<NaiveDate, f64>, Box<dyn std::error::Error>> {
+    // 關鍵功能註解：解析 Kenneth French 動量因子 CSV 內容 暫時用不到
+     fn parse_mom_csv(csv_content: &str) -> anyhow::Result<BTreeMap<NaiveDate, f64>> {
         let mut mom_map = BTreeMap::new();
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
@@ -847,7 +849,7 @@ impl MarketDatabase {
     // 關鍵功能註解：並行下載 5 因子與動量 Zip 檔並合併為 6 因子資料列
     pub async fn fetch_fama_french_6_factors_daily(
         client: &reqwest::Client,
-    ) -> Result<Vec<FamaFrench6FactorRecord>, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<Vec<FamaFrench6FactorRecord>> {
         let base_url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/";
         let url_5f = format!("{base_url}F-F_Research_Data_5_Factors_2x3_daily_CSV.zip");
         let url_mom = format!("{base_url}F-F_Momentum_Factor_daily_CSV.zip");
@@ -922,7 +924,7 @@ impl MarketDatabase {
             query.execute(&self.pool).await?;
         }
 
-        println!("✅ 成功將 {} 筆 6 因子記錄同步至 PostgreSQL 喵！", records.len());
+        info!("✅ 成功將 {} 筆 6 因子記錄同步至 PostgreSQL 喵！", records.len());
         Ok(())
     }
     pub async fn load_fama_french_factors(
@@ -998,7 +1000,7 @@ impl MarketDatabase {
         &self,
         timeframe: &TimeframeConfig,
         klines: Vec<KLine>,
-    ) -> Result<u64, Box<dyn std::error::Error>> {
+    )-> anyhow::Result<u64> {
         if klines.is_empty() {
             return Ok(0);
         }
@@ -1116,7 +1118,7 @@ impl MarketDatabase {
 
             let count: i64 = count_row.get(0);
 
-            println!(
+            info!(
                 "=== 標的: {} ({}) [資料表: {}] (資料庫內總計 {} 筆) ===",
                 symbol, asset_id, table_name, count
             );
@@ -1363,7 +1365,7 @@ impl MarketDatabase {
     asset_id: &uuid::Uuid,
     timeframe: &TimeframeConfig,
     required_start_iso: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> anyhow::Result<bool> {
     let table_name = match timeframe {
         TimeframeConfig::OneDay => "daily_prices",
         TimeframeConfig::FiveMinutes => "klines",
@@ -1479,7 +1481,7 @@ pub async fn save_portfolio_weights(
 
     // 關鍵功能註解：使用 QueryBuilder 搭配 push_tuples 構建批次 UPDATE 語句並同步更新 weight_updated_at
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
-        "UPDATE portfolio_targets AS pt SET weight = val.weight, FROMweight_updated_at = "
+        "UPDATE portfolio_targets AS pt SET weight = val.weight, weight_updated_at = "
     );
     
     builder.push_bind(current_timestamp);

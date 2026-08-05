@@ -1,10 +1,12 @@
 ﻿use rust_decimal::Decimal;
 use std::collections::HashMap;
+use crate::db_storage::MarketDatabase;
 use crate::trading;
 use crate::backtest::AnalysisResult;
 use crate::trading::{Account,Position,OrderMethod,OrderType,OrderTypeInput,Side,TimeInForce};
 use crate::config;
 use rust_decimal::prelude::ToPrimitive;
+use tracing::{info,warn,error,debug};
 use tokio::sync::mpsc;
 use futures_util::StreamExt; // 關鍵功能註解：導入 StreamExt 以使用 split() 與 next() 方法
 use futures_util::SinkExt;   // 若上方 send 還有用到，也可一併確認導入
@@ -22,7 +24,7 @@ pub struct BarUpdate {
 pub async fn start_websocket_listener(
     symbols: Vec<String>,
     tx: mpsc::Sender<BarUpdate>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<()>  {
     // 關鍵功能註解：請根據實際採用的交易所或行情源替換 Ws Url 與 認證 Token 實盤交易把iex換成sip
     let url = "wss://stream.data.alpaca.markets/v2/iex";
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
@@ -108,7 +110,7 @@ impl Default for RiskConfig {
         }
     }
 }
-
+#[derive(Clone)]
 pub struct RiskManager {
     db_pool: sqlx::PgPool,
     http_client: reqwest::Client,
@@ -132,9 +134,9 @@ impl RiskManager {
     &self,
     bar: &BarUpdate,
     peak_prices: &mut HashMap<String, Decimal>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     // 關鍵功能註解：抓取目前帳戶持倉，若未持倉則直接跳過檢查
-    let positions = trading::get_positions(&self.http_client).await?;
+    let positions = trading::get_positions(&self.http_client).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let pos = match positions.iter().find(|p| p.symbol == bar.symbol) {
         Some(p) => p,
         None => return Ok(()),
@@ -179,7 +181,7 @@ impl RiskManager {
 
     // 關鍵功能註解：若滿足任一風控條件，發送市價單立即平倉並清除最高價紀錄
     if let Some(reason) = trigger_reason {
-        println!("[即時風控攔截] 標的 {} {}，雙軌高速軌發送平倉單！", bar.symbol, reason);
+        info!("[即時風控攔截] 標的 {} {}，雙軌高速軌發送平倉單！", bar.symbol, reason);
         
         trading::place_order(
             &self.http_client,
@@ -189,7 +191,7 @@ impl RiskManager {
             TimeInForce::Day,
             OrderMethod::Qty(pos.qty.abs()),
             false,
-        ).await?;
+        ).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         peak_prices.remove(&bar.symbol);
     }
@@ -199,15 +201,16 @@ impl RiskManager {
     /// 風控模組的核心進入點
 pub async fn run_risk_manager(
     &self,
+    db:&MarketDatabase,
     client: &reqwest::Client,
     analysis: AnalysisResult,
     daily_blacklisted_symbols: &std::collections::HashSet<String>,
     basic_weights: &std::collections::HashMap<String, Decimal>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
 
     // 關鍵功能註解：開頭先撤銷所有未成交舊掛單，釋放購買力與持倉鎖定
     if let Err(e) = trading::cancel_orders(client, None).await {
-        println!("撤銷舊掛單時發生警告: {:?}", e);
+        warn!("撤銷舊掛單時發生警告: {:?}", e);
     }
 
     // 關鍵功能註解：抓取 Alpaca 最新帳戶權益與現有持倉狀態
@@ -223,8 +226,8 @@ pub async fn run_risk_manager(
         .map(|p| (p.symbol.clone(), p))
         .collect();
 
-    // 關鍵功能註解：以傳入的 basic_weights 為基礎進行目標權重調整
-    let mut target_weights = basic_weights.clone();
+    // 關鍵功能註解：目標權重永遠以最新分析出的 analysis.weights 為準
+    let mut target_weights = analysis.weights.clone();
 
     // 關鍵功能註解：套用 features 動態指標 (如布林通道超買超賣區清倉)
     for (symbol, feat) in &analysis.features {
@@ -243,10 +246,36 @@ pub async fn run_risk_manager(
     // 關鍵功能註解：設定偏離度觸發門檻 (1% = 0.01)
     let rebalance_threshold = rust_decimal_macros::dec!(0.01);
 
+    // 關鍵功能註解：判斷是否需要執行 Rebalance（若 basic_weights 為空則強制執行）
+    let mut should_rebalance = basic_weights.is_empty();
+
+    if !should_rebalance {
+        let mut check_symbols = std::collections::HashSet::new();
+        for k in target_weights.keys() { check_symbols.insert(k.clone()); }
+        for k in basic_weights.keys() { check_symbols.insert(k.clone()); }
+
+        for symbol in check_symbols {
+            let target_w = target_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+            let basic_w = basic_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+
+            // 關鍵功能註解：比較 analysis.weights 與 basic_weights 的偏離度是否達標
+            if (target_w - basic_w).abs() >= rebalance_threshold {
+                should_rebalance = true;
+                break;
+            }
+        }
+    }
+
+    // 關鍵功能註解：偏離度未達門檻且 basic_weights 不為空時跳過 Rebalance
+    if !should_rebalance {
+        debug!("權重偏離度未達門檻且基準存在，跳過 Rebalance");
+        return Ok(());
+    }
+
     let mut sell_orders = Vec::new();
     let mut buy_orders = Vec::new();
 
-    // 關鍵功能註解：聯集所有需要檢查的標的 (現有持倉 + 目標標的)
+    // 關鍵功能註解：聯集所有需要計算的標的 (現有持倉 + 目標標的)
     let mut all_symbols = std::collections::HashSet::new();
     for k in current_positions.keys() { all_symbols.insert(k.clone()); }
     for k in target_weights.keys() { all_symbols.insert(k.clone()); }
@@ -254,7 +283,6 @@ pub async fn run_risk_manager(
     for symbol in all_symbols {
         let current_pos = current_positions.get(&symbol);
         
-        // 關鍵功能註解：計算當前實際持倉金額與目前持倉權重
         let current_qty = current_pos.map(|p| p.qty).unwrap_or(Decimal::ZERO);
         let current_price = current_pos
             .map(|p| p.current_price)
@@ -264,25 +292,7 @@ pub async fn run_risk_manager(
                 ).unwrap_or(Decimal::ONE)
             });
 
-        let current_market_value = current_qty * current_price;
-        let current_weight = if safe_equity.is_zero() {
-            Decimal::ZERO
-        } else {
-            current_market_value / safe_equity
-        };
-
-        // 關鍵功能註解：取得目標權重 (若不在 target_weights 內則視為 0)
         let target_weight = target_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
-
-        // 關鍵功能註解：計算權重絕對偏離度
-        let weight_diff = (target_weight - current_weight).abs();
-
-        // 關鍵功能註解：當偏離度未達門檻且目標權重不為零時，不觸發 Rebalance
-        if weight_diff < rebalance_threshold && target_weight > Decimal::ZERO {
-            continue;
-        }
-
-        // 關鍵功能註解：根據目標權重計算應調整之目標股數與 Delta 股數
         let target_value = safe_equity * target_weight;
         let target_qty = (target_value / current_price).trunc();
         let delta_qty = target_qty - current_qty;
@@ -293,6 +303,9 @@ pub async fn run_risk_manager(
             buy_orders.push((symbol, delta_qty));
         }
     }
+
+    debug!("目前的賣單：{:?}", sell_orders);
+    debug!("目前的買單：{:?}", buy_orders);
 
     // 關鍵功能註解：優先執行賣單釋放資金
     for (symbol, qty) in sell_orders {
@@ -320,6 +333,13 @@ pub async fn run_risk_manager(
             OrderMethod::Qty(qty),
             false,
         ).await?;
+    }
+
+    // 關鍵功能註解：觸發 Rebalance 並完成下單後，寫入 DB 更新權重基準
+    if let Err(e) = db.save_portfolio_weights(&target_weights).await {
+        error!("Rebalance 後更新資料庫權重失敗: {:?}", e);
+    } else {
+        info!("成功執行 Rebalance 並將最新權重覆寫至 DB！");
     }
 
     Ok(())

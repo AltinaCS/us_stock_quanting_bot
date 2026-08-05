@@ -1,11 +1,11 @@
 ﻿use std::collections::{BTreeMap,BTreeSet,HashMap};
+use tracing::{debug, error, info, warn};
 use chrono::{DateTime, Utc,NaiveDate};
 use serde::Deserialize;
 use serde::Serialize;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use crate::{db_storage::{MarketDatabase, TimeframeConfig,TargetType,KLine}, selector::SelectionPipeline};
-use tracing::warn;
 use std::time::Instant;
 use uuid::Uuid;
 use anyhow::{anyhow,Context,Result};
@@ -834,7 +834,7 @@ pub async fn verify_klines_integrity(
     end_ts: i64,
 ) -> Result<BTreeMap<String, (usize, i64)>, String> {
     let targets = db.load_portfolio_targets().await?;
-    println!("載入當前投資組合目標清單成功");
+    info!("載入當前投資組合目標清單成功");
     let mut symbol_stats = BTreeMap::new();
 
     for target in targets {
@@ -945,128 +945,82 @@ pub async fn run_analysis(
     _symbols: &[String],
     config: &AnalysisConfig,
     save_to_db: bool
-) -> Result<AnalysisResult, String> {
+) -> anyhow::Result<AnalysisResult> {
     let end_ts = config.as_of_ts.unwrap_or_else(|| Utc::now().timestamp());
     let start_iso_str = config.start_iso.as_deref();
     
     let start_ts = match start_iso_str {
         Some(iso) => DateTime::parse_from_rfc3339(iso)
-            .map_err(|e| format!("無效的 ISO 時間格式 ({}): {}", iso, e))?
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
             .timestamp(),
         None => 946684800,
     };
-      // 階段 1：補資料與資料對齊
-    // ==========================================
-    SelectionPipeline::backfill_portfolio_klines(client, db, start_iso_str, &config.timeframe)
-        .await
-        .map_err(|e| e.to_string())?; 
-    println!("資料補齊完成");
 
-    let _stats = verify_klines_integrity(db, start_ts, end_ts).await?;
+    // 階段 1：補資料與資料對齊
+    SelectionPipeline::backfill_portfolio_klines(client, db, start_iso_str, &config.timeframe).await.map_err(|e| anyhow::anyhow!(e.to_string()))?; 
+    info!("資料補齊完成");
 
-    let targets = db.load_portfolio_targets().await?;
+    let _stats = verify_klines_integrity(db, start_ts, end_ts).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let targets = db.load_portfolio_targets().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut raw_klines_map = HashMap::new();
 
     for target in &targets {
         let klines = db
             .query_klines_by_range(target.asset_id, &config.timeframe, start_ts, end_ts)
-            .await?;
+            .await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         raw_klines_map.insert(target.symbol.clone(), klines);
     }
-    //階段2 初步計算歷史對數日報酬率與共變異數矩陣
-    // ==========================================
+
+    // 階段 2 初步計算歷史對數日報酬率與共變異數矩陣
     let aligned_data = align_and_forward_fill(&raw_klines_map);
     let daily_log_returns = compute_daily_log_returns(&aligned_data);
     let base_stats = compute_base_statistics(&daily_log_returns);
-    let file = File::create("daily_log_returns_data.json").map_err(|e|e.to_string())?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, &daily_log_returns).map_err(|e|e.to_string())?;
 
+    // 關鍵功能註解：將同步檔案 IO 隔離在獨立作用域，避免 std::io::Error 殘留跨越後續 await
+    {
+        let file = File::create("daily_log_returns_data.json").map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, &daily_log_returns).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
 
-// ==========================================
-    // 階段 3：實時特徵工程與動態模型 (Feature Engineering & Latent Factor Model)
-    // ==========================================
-
-    // 3.1 純量價特徵與市場熱度 (直接從 aligned_data 計算)
-    // 產出：每檔標的之動量、極端波動與流動性衝擊 (RSI, ATR, Parkinson Vol, Volume Z-Score, Amihud)
-    // 用途：ATR / Volatility 用於風險預算 (Risk Budgeting) 與頭寸縮放，RSI/Volume 用於風控與Timing overlay
-    // 關鍵功能註解：從 aligned_data 提取純量價多維特徵矩陣
-    let tech_features: HashMap<String, HashMap<String, f64>> = compute_pure_price_features(&aligned_data,end_ts)
-    .with_context(|| format!("執行 run_analysis 階段 3 失敗 [end_ts: {}, timeframe: {:?}]", end_ts, config.timeframe))
-    .map_err(|e| format!("{:?}", e))?;
-    // 3.2 橫截面 PCA 主成分分析 (替代傳統 Fama-French 因子)
-    // 產出：本地即時 SVD 分解出的隱性市場因子 (PC1 大盤共性, PC2 板塊輪動) 與個股 Alpha 殘差
-    // 用途：完全排除外部財報延遲與黑盒子，100% 零延遲生成客觀的隱性因子與 Alpha 觀點 vector (Q)
-    // 關鍵功能註解：對價格報酬率矩陣執行 PCA 降維並提取個股殘差 Alpha
+    // 階段 3：實時特徵工程與動態模型
+    let tech_features: HashMap<String, HashMap<String, f64>> = compute_pure_price_features(&aligned_data, end_ts)
+        .with_context(|| format!("執行 run_analysis 階段 3 失敗 [end_ts: {}, timeframe: {:?}]", end_ts, config.timeframe))?;
 
     let latent_factor_analysis = compute_cross_sectional_pca(&daily_log_returns, 3)
-    .with_context(|| "執行 run_analysis 階段 3.2 PCA 隱性因子分解失敗")
-    .map_err(|e| format!("{:?}", e))?;
-    //println!("{:#?}",latent_factor_analysis);
-    // 3.3 時序與動態模型 (條件波動率與協整)
-    // 產出：GARCH-Student-t / DCC-GARCH 動態協方差矩陣 Σ (考慮肥尾與波動聚集)
-    // 用途：替代傳統 Sample Covariance，精準捕捉暴跌時的波動性激增與尾端風險
-    // 關鍵功能註解：擬合動態協方差矩陣以捕捉市場非對稱波動
-    let garch_cov_matrix = compute_factor_garch_cov(&daily_log_returns,&latent_factor_analysis,3)
-    .with_context(|| "執行 run_analysis 階段 3.3 GARCH時序與動態模型失敗")
-    .map_err(|e| format!("{:?}", e))?;
-    //println!("PCA 因子解釋比例: {:#?}", garch_cov_matrix);
+        .with_context(|| "執行 run_analysis 階段 3.2 PCA 隱性因子分解失敗")?;
 
-    // ==========================================
-    // 階段 4：理論投資組合建構 (Theoretical Portfolio Optimization)
-    // ==========================================
+    let garch_cov_matrix = compute_factor_garch_cov(&daily_log_returns, &latent_factor_analysis, 3)
+        .with_context(|| "執行 run_analysis 階段 3.3 GARCH時序與動態模型失敗")?;
 
+    // 階段 4：理論投資組合建構
     let symbols: Vec<String> = daily_log_returns.returns.keys().cloned().collect();
-    let tau = 0.025; // Tau 參數預設 0.025
-    let risk_aversion = 2.5; // 風險趨避係數 Gamma 預設 2.5
+    let tau = 0.025;
+    let risk_aversion = 2.5;
 
-    // 4.1 彙整觀點 (Views) 與市場均衡
     let bl_views = build_views_from_pca_alpha(&latent_factor_analysis, &tech_features, &symbols, &garch_cov_matrix, tau)
-        .with_context(|| "執行 run_analysis 階段 4.1 構建 BL 觀點矩陣失敗")
-        .map_err(|e| format!("{:?}", e))?;
+        .with_context(|| "執行 run_analysis 階段 4.1 構建 BL 觀點矩陣失敗")?;
 
-    // 4.2 Black-Litterman 模型計算
     let bl_result = run_black_litterman(&symbols, &garch_cov_matrix, &bl_views, tau, risk_aversion)
-        .with_context(|| "執行 run_analysis 階段 4.2 Black-Litterman 求解失敗")
-        .map_err(|e| format!("{:?}", e))?;
+        .with_context(|| "執行 run_analysis 階段 4.2 Black-Litterman 求解失敗")?;
 
-    // 4.3 風控與動態 Overlay 縮放
     let target_decimal_weights: HashMap<String, Decimal> = apply_risk_overlay_and_convert(
         &bl_result.target_weights,
         &tech_features,
-        8,      // 保留 8 位小數
-        0.0001, // 低於 0.01% 的微小頭寸過濾
+        8,
+        0.0001,
     );
-    // ==========================================
-    // 階段 5：幾何路徑與極端風險模擬 (Monte Carlo & Stress Testing) (這部分會開新的thread 然後暫時先不處理)
-    // ==========================================
 
-    // 5.1 對理論組合執行 Jump-Diffusion 蒙地卡羅模擬 (10,000 次路徑)
-    // 5.2 計算理論 99% VaR / CVaR 與極端情境穿透率 (Tail Risk Analysis)
-    // 5.3 風控熔斷與技術面 Timing Overlay 修正，產出最終可執行權重 w_target
-    // 關鍵功能註解：執行 10,000 次蒙地卡羅模擬評估尾端風險 (VaR / CVaR)
-    //let mc_results = run_monte_carlo_simulation(&theoretical_weights, &garch_cov_matrix, 10000)?;
-    //let tail_risk = compute_tail_risk(&mc_results);
-
-    // 關鍵功能註解：結合 CVaR 風控預算上限與極端 Z-Score / ATR 斷路器，產出最終目標組合
-    //let final_portfolio = apply_risk_budget_and_timing(&theoretical_weights, &tail_risk, &tech_features);
-
-
-    // ==========================================
-    // 產出最終分析結果打包 (Analysis Result Output)
-    // ==========================================
-    // 提供給非交易時段分析報告，以及對接實盤風控模組做校準與對比
-    //TODO：
-    if save_to_db{
-        db.save_portfolio_weights(&target_decimal_weights).await?;
-        println!("[DB] 成功存入當日開盤基準權重與分析數據");
+    if save_to_db {
+        db.save_portfolio_weights(&target_decimal_weights).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        info!("[DB] 成功存入當日開盤基準權重與分析數據");
     }
     
-    Ok(AnalysisResult{
-        start_ts:start_ts,
-        end_ts:end_ts,
-        features:tech_features,
-        weights:target_decimal_weights,
-    }
-    )
+    Ok(AnalysisResult {
+        start_ts,
+        end_ts,
+        features: tech_features,
+        weights: target_decimal_weights,
+    })
 }
