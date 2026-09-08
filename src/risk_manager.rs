@@ -201,7 +201,7 @@ impl RiskManager {
     /// 風控模組的核心進入點
 pub async fn run_risk_manager(
     &self,
-    db:&MarketDatabase,
+    db: &MarketDatabase,
     client: &reqwest::Client,
     analysis: AnalysisResult,
     daily_blacklisted_symbols: &std::collections::HashSet<String>,
@@ -214,8 +214,8 @@ pub async fn run_risk_manager(
     }
 
     // 關鍵功能註解：抓取 Alpaca 最新帳戶權益與現有持倉狀態
-    let account = trading::get_account(client).await?;
-    let positions = trading::get_positions(client).await?;
+    let account = trading::get_account(client).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let positions = trading::get_positions(client).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
     
     // 關鍵功能註解：可調度總資產保留 0.5% Buffer 預防滑點與微量交易費
     let safe_equity = account.total_equity * rust_decimal_macros::dec!(0.995);
@@ -225,6 +225,15 @@ pub async fn run_risk_manager(
         .iter()
         .map(|p| (p.symbol.clone(), p))
         .collect();
+
+    // 關鍵功能註解：計算實體帳戶中各股票之真實持倉比重
+    let mut current_weights: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
+    if safe_equity > Decimal::ZERO {
+        for p in &positions {
+            let market_val = p.qty * p.current_price;
+            current_weights.insert(p.symbol.clone(), market_val / safe_equity);
+        }
+    }
 
     // 關鍵功能註解：目標權重永遠以最新分析出的 analysis.weights 為準
     let mut target_weights = analysis.weights.clone();
@@ -246,27 +255,30 @@ pub async fn run_risk_manager(
     // 關鍵功能註解：設定偏離度觸發門檻 (1% = 0.01)
     let rebalance_threshold = rust_decimal_macros::dec!(0.01);
 
-    // 關鍵功能註解：判斷是否需要執行 Rebalance（若 basic_weights 為空則強制執行）
-    let mut should_rebalance = basic_weights.is_empty();
+    // 關鍵功能註解：未持倉、無紀錄或基準為空時強制觸發調倉
+    let mut should_rebalance = positions.is_empty() || basic_weights.is_empty();
 
     if !should_rebalance {
         let mut check_symbols = std::collections::HashSet::new();
         for k in target_weights.keys() { check_symbols.insert(k.clone()); }
-        for k in basic_weights.keys() { check_symbols.insert(k.clone()); }
+        for k in current_weights.keys() { check_symbols.insert(k.clone()); }
 
         for symbol in check_symbols {
             let target_w = target_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
-            let basic_w = basic_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+            let current_w = current_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
+            let diff = (target_w - current_w).abs();
 
-            // 關鍵功能註解：比較 analysis.weights 與 basic_weights 的偏離度是否達標
-            if (target_w - basic_w).abs() >= rebalance_threshold {
+            debug!("標的 {} 目標權重: {}, 當前持倉比重: {}, 偏離度: {}", symbol, target_w, current_w, diff);
+
+            // 關鍵功能註解：比對目標權重與真實持倉比重偏離度
+            if diff >= rebalance_threshold {
                 should_rebalance = true;
                 break;
             }
         }
     }
 
-    // 關鍵功能註解：偏離度未達門檻且 basic_weights 不為空時跳過 Rebalance
+    // 關鍵功能註解：偏離度未達門檻且基準存在，跳過 Rebalance
     if !should_rebalance {
         debug!("權重偏離度未達門檻且基準存在，跳過 Rebalance");
         return Ok(());
@@ -284,13 +296,18 @@ pub async fn run_risk_manager(
         let current_pos = current_positions.get(&symbol);
         
         let current_qty = current_pos.map(|p| p.qty).unwrap_or(Decimal::ZERO);
-        let current_price = current_pos
-            .map(|p| p.current_price)
-            .unwrap_or_else(|| {
-                Decimal::from_f64_retain(
-                    *analysis.features.get(&symbol).and_then(|f| f.get("close")).unwrap_or(&1.0)
-                ).unwrap_or(Decimal::ONE)
-            });
+
+        // 關鍵功能註解：若有持倉則取當前價，若無持倉則自 API 或 DB 取得最新價格
+        let current_price = match current_pos {
+            Some(p) if p.current_price > Decimal::ZERO => p.current_price,
+            _ => match trading::get_latest_price(client, &symbol).await {
+                Ok(price) if price > Decimal::ZERO => price,
+                _ => {
+                    error!("無法取得標的 {} 之最新價格，跳過該標的計算", symbol);
+                    continue;
+                }
+            }
+        };
 
         let target_weight = target_weights.get(&symbol).copied().unwrap_or(Decimal::ZERO);
         let target_value = safe_equity * target_weight;
@@ -307,10 +324,10 @@ pub async fn run_risk_manager(
     debug!("目前的賣單：{:?}", sell_orders);
     debug!("目前的買單：{:?}", buy_orders);
 
-    // 關鍵功能註解：優先執行賣單釋放資金
+    // 關鍵功能註解：優先執行賣單釋放資金，遇到單一失敗不中斷流程
     for (symbol, qty) in sell_orders {
         if qty.is_zero() { continue; }
-        trading::place_order(
+        if let Err(e) = trading::place_order(
             client,
             &symbol,
             Side::Sell,
@@ -318,13 +335,18 @@ pub async fn run_risk_manager(
             TimeInForce::Day,
             OrderMethod::Qty(qty),
             false,
-        ).await?;
+        ).await {
+            error!("賣單失敗 ({}, 數量: {}): {:?}", symbol, qty, e);
+        }
     }
 
-    // 關鍵功能註解：賣單完成後執行買單
+    // 關鍵功能註解：等待 2 秒確保 Alpaca 賣單撮合完畢並更新可調度購買力
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // 關鍵功能註解：執行買單，單一失敗僅紀錄 Log 不中斷後續其他買單發送
     for (symbol, qty) in buy_orders {
         if qty.is_zero() { continue; }
-        trading::place_order(
+        if let Err(e) = trading::place_order(
             client,
             &symbol,
             Side::Buy,
@@ -332,7 +354,9 @@ pub async fn run_risk_manager(
             TimeInForce::Day,
             OrderMethod::Qty(qty),
             false,
-        ).await?;
+        ).await {
+            error!("買單失敗 ({}, 數量: {}): {:?}", symbol, qty, e);
+        }
     }
 
     // 關鍵功能註解：觸發 Rebalance 並完成下單後，寫入 DB 更新權重基準

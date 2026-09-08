@@ -41,9 +41,15 @@ pub fn init_logging() -> WorkerGuard {
 
         error!(target: "panic", location = %location, message = %payload, "系統發生未預期的 panic！");
     }));
-    // 關鍵功能註解：自動讀取 RUST_LOG 環境變數，預設為 info 等級
+
+    // 關鍵功能註解：讀取設定檔等級並追加指令屏蔽第三方網路庫雜訊 Log
     let env_filter = EnvFilter::try_new(&*config::LOG_LEVEL)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("hyper=warn".parse().unwrap())
+        .add_directive("hyper_util=warn".parse().unwrap())
+        .add_directive("h2=warn".parse().unwrap())
+        .add_directive("reqwest=warn".parse().unwrap())
+        .add_directive("sqlx=warn".parse().unwrap());
 
     // 關鍵功能註解：設定每日滾動日誌檔案輸出路徑與檔名
     let log_dir = "./logs";
