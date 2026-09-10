@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+﻿use std::sync::LazyLock;
 
 // 關鍵功能註解：全域環境變數，第一次存取時自動載入並讀取
 pub static API_KEY: LazyLock<String> = LazyLock::new(|| {
@@ -35,3 +35,4 @@ pub static LOG_LEVEL: LazyLock<String> = LazyLock::new(|| {
     let _ = dotenvy::dotenv();
     std::env::var("RUST_LOG").unwrap_or_else(|_| "debug,sqlx=warn".to_string())
 });
+pub const RISK_FREE_RATE: f64 = 0.039; //使用3個月期國債
