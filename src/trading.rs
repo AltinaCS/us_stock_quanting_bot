@@ -1,14 +1,17 @@
-use rust_decimal_macros::dec;
+﻿use rust_decimal_macros::dec;
 use rust_decimal;
 use rust_decimal::Decimal;
 use serde::{Serialize,Deserialize};
 use reqwest::{Client, header::{HeaderMap, HeaderValue}};
+use sqlx::any;
 use std::sync::OnceLock;
 use crate::config;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use indicatif::{ProgressBar, ProgressStyle};
+use tracing::{info,debug,warn,error};
+use anyhow::Context;
 #[derive(Debug, Deserialize)]
 pub struct Account {
     // 註解：總資產淨值（持倉市值 + 現金），計算動態權重的分母
@@ -83,7 +86,7 @@ pub async fn place_order(
     mut tif: TimeInForce,
     method: OrderMethod,
     extended_hours: bool,
-) -> anyhow::Result<String> {
+) -> Result<String, Box<dyn std::error::Error>> {
     
     // 註解：依據輸入類型解構出API需要的類型與價格
     let (mut order_type, limit_price) = match order_type_input {
@@ -141,12 +144,12 @@ pub async fn place_order(
     let json: serde_json::Value = response.json().await?;
     let order_id = json["id"].as_str().unwrap_or("").to_string();
     
-    println!("--- 送出結果 ({}) ---", symbol);
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    info!("--- 送出結果 ({}) ---", symbol);
+    info!("{}", serde_json::to_string_pretty(&json)?);
     
     Ok(order_id)
 }
-pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> anyhow::Result<()> {
+pub async fn get_orders(client: &reqwest::Client, order_id: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // 根據是否有ID決定URL，None就是撈取全部掛單
     let url = match order_id {
         Some(id) => format!("{}/v2/orders/{}", &*config::BASE_URL, id),
@@ -194,7 +197,7 @@ pub async fn cancel_orders(client: &reqwest::Client, order_id: Option<&str>) -> 
 // 關鍵功能：向 Alpaca 請求當前所有持倉的非同步函式
 pub async fn get_positions(
     client: &reqwest::Client,
-) -> anyhow::Result<Vec<Position>> {
+) -> Result<Vec<Position>, Box<dyn std::error::Error>> {
     let url = format!("{}/v2/positions", &*config::BASE_URL);
 
     // 1. 發送 GET 請求獲取持倉列表
@@ -208,7 +211,7 @@ pub async fn get_positions(
     // 2. 處理錯誤狀態碼
     if !response.status().is_success() {
         let err_text = response.text().await?;
-        return Err(anyhow::anyhow!("獲取持倉失敗: {}", err_text));
+        return Err(format!("獲取持倉失敗: {}", err_text).into());
     }
 
     // 3. 直接反序列化成高精度的 Vec<Position> 向量
@@ -218,7 +221,7 @@ pub async fn get_positions(
 }
 pub async fn get_account(
     client: &reqwest::Client,
-) -> anyhow::Result<Account> {
+) -> Result<Account, Box<dyn std::error::Error>> {
     let url = format!("{}/v2/account", &*config::BASE_URL);
 
     let response = client
@@ -230,9 +233,40 @@ pub async fn get_account(
    
     if !response.status().is_success() {
         let err_text = response.text().await?;
-        return Err(anyhow::anyhow!("獲取帳戶失敗: {}", err_text));
+        return Err(format!("獲取帳戶失敗: {}", err_text).into());
     }
 
     let account: Account = response.json().await?;
     Ok(account)
 }
+pub async fn get_latest_price(
+    client: &reqwest::Client,
+    symbol: &str,
+) -> anyhow::Result<rust_decimal::Decimal> {
+
+    // 關鍵功能註解：向 Alpaca 市價 API 請求最新成交價 Trade 資料
+    let url = format!("https://data.alpaca.markets/v2/stocks/{}/trades/latest", symbol);
+
+    let resp: serde_json::Value = client
+        .get(&url)
+        .header("APCA-API-KEY-ID", &*config::API_KEY)
+        .header("APCA-API-SECRET-KEY", &*config::API_SECRET)
+        .send()
+        .await
+        .with_context(|| format!("無法取得 {} 之最新價格連線", symbol))?
+        .json()
+        .await
+        .with_context(|| format!("解析 {} 最新價格 JSON 失敗", symbol))?;
+
+    // 關鍵功能註解：自 trade 物件中提取最新成交價格 p 欄位
+    let price_f64 = resp["trade"]["p"]
+        .as_f64()
+        .ok_or_else(|| anyhow::anyhow!("標的 {} 回傳資料中缺少價格欄位", symbol))?;
+
+    let price = rust_decimal::Decimal::from_f64_retain(price_f64)
+        .ok_or_else(|| anyhow::anyhow!("標的 {} 價格轉 Decimal 失敗", symbol))?;
+
+    Ok(price)
+}
+
+

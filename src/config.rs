@@ -30,7 +30,9 @@ pub static CACHE_RETENTION_DAYS: LazyLock<i64> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())                                                                                                                         
         .unwrap_or(90)                                                                                                                                        
 });
-pub static LOG_LEVEL: LazyLock<String> = LazyLock::new(|| {                                                                                           
-    let _ = dotenvy::dotenv();                                                                                                                                
-    std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".to_string())                                                                                                                                     
+// 關鍵功能註解：全域日誌層級過濾，預設過濾掉 sqlx 詳細查詢
+pub static LOG_LEVEL: LazyLock<String> = LazyLock::new(|| {
+    let _ = dotenvy::dotenv();
+    std::env::var("RUST_LOG").unwrap_or_else(|_| "debug,sqlx=warn".to_string())
 });
+pub const RISK_FREE_RATE: f64 = 0.039; //使用3個月期國債

@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
+use crate::backtest::RiskFreeInput::TimeSeries;
+use crate::config::RISK_FREE_RATE;
 use crate::{db_storage::{MarketDatabase, TimeframeConfig,TargetType,KLine}, selector::SelectionPipeline};
 use std::time::Instant;
 use uuid::Uuid;
@@ -16,9 +18,12 @@ use std::fs::File;
 use std::io::BufWriter;
 #[derive(Debug, Clone)]
 pub struct BlackLittermanViews {
-    pub p_matrix: Array2<f64>, // N x N 單位矩陣
-    pub q_vector: Array1<f64>, // N x 1 觀點向量 (PCA Alpha 殘差)
-    pub omega_matrix: Array2<f64>, // N x N 觀點不確定性對角矩陣
+    /// 觀點矩陣 P (P x N)
+    pub p_matrix: DMatrix<f64>,
+    /// 觀點向量 Q (P x 1)
+    pub q_vector: DVector<f64>,
+    /// 觀點不確定性協方差矩陣 Omega (P x P)
+    pub omega_matrix: DMatrix<f64>,
 }
 #[derive(Debug, Clone)]
 pub struct BlackLittermanResult {
@@ -32,6 +37,17 @@ pub struct DailyLogReturns {
     pub timestamps: Vec<i64>,
     /// 每檔標的對應的單期 Log Return 時間序列 (長度為 timestamps.len() - 1)
     pub returns: BTreeMap<String, Vec<Option<f64>>>,
+}
+#[derive(Debug, Clone)]
+pub struct RiskMetrics {
+    /// 年化夏普比率 (Sharpe Ratio)
+    pub sharpe_ratio: f64,
+    /// 最大回撤 (Maximum Drawdown, MDD)，以正數或負數比例表示 (例如 -0.15 代表 -15%)
+    pub max_drawdown: f64,
+    /// 年化波動率 (Annualized Volatility)
+    pub annualized_volatility: f64,
+    /// 年化報酬率 (Annualized Return)
+    pub annualized_return: f64,
 }
 #[derive(Debug, Clone)]
 pub struct LatentFactorResult {
@@ -69,7 +85,11 @@ pub struct DailyPriceSnapshot {
     pub timestamp: DateTime<Utc>,
     pub prices: BTreeMap<String, f64>,
 }
-
+#[derive(Debug,Clone)]
+pub enum RiskFreeInput{
+    Fixed,
+    TimeSeries,
+}
 /// 關鍵功能註解：純統計分析結果輸出容器
 #[derive(Debug, Clone,Serialize,Deserialize)]
 pub struct AnalysisResult {
@@ -102,7 +122,7 @@ pub fn build_views_from_pca_alpha(
     latent_result: &LatentFactorResult,
     tech_features: &HashMap<String, HashMap<String, f64>>,
     symbols: &[String],
-    garch_cov: &HashMap<String, HashMap<String, f64>>,
+    cov_matrix: &DMatrix<f64>,
     tau: f64,
 ) -> Result<BlackLittermanViews> {
     let n = symbols.len();
@@ -110,40 +130,39 @@ pub fn build_views_from_pca_alpha(
         return Err(anyhow!("資產列表為空，無法構建 BL 觀點"));
     }
 
-    let p_matrix = Array2::eye(n);
-    let mut q_vector = Array1::zeros(n);
-    let mut omega_matrix = Array2::zeros((n, n));
+    // 預設為對角線絕對觀點 (P 矩陣為 N x N 單位矩陣)
+    let p_matrix = DMatrix::identity(n, n);
+    let mut q_vector = DVector::zeros(n);
+    let mut omega_matrix = DMatrix::zeros(n, n);
 
     for (i, symbol) in symbols.iter().enumerate() {
         let raw_alpha = latent_result
             .alpha_residuals
             .get(symbol)
-            .cloned()
+            .copied()
             .unwrap_or(0.0);
 
-        let var_i = garch_cov
-            .get(symbol)
-            .and_then(|row| row.get(symbol))
-            .cloned()
-            .unwrap_or(0.0001);
+        // 取出 base_stats 的對角線方差 (Variance)
+        let var_i = if i < cov_matrix.nrows() {
+            cov_matrix[(i, i)]
+        } else {
+            0.0001
+        };
 
         let mut multiplier = 1.0;
         let mut uncertainty_scaler = 1.0;
 
+        // 微調特徵懲罰 (未來可由 ML 預測勝率直接取代)
         if let Some(feats) = tech_features.get(symbol) {
-            let rsi = feats.get("rsi_14").cloned().unwrap_or(50.0);
-            let amihud = feats.get("amihud_illiquidity").cloned().unwrap_or(0.0);
-
+            let rsi = feats.get("rsi_14").copied().unwrap_or(50.0);
             if rsi > 70.0 && raw_alpha > 0.0 {
-                multiplier *= 0.5;
-            }
-            if amihud > 0.001 {
-                uncertainty_scaler *= 1.5;
+                multiplier *= 0.5; // 超買時調低 Alpha 預期
             }
         }
 
         q_vector[i] = raw_alpha * multiplier;
-        omega_matrix[[i, i]] = (tau * var_i * uncertainty_scaler).max(1e-8);
+        // Omega_i = tau * var_i * scaler
+        omega_matrix[(i, i)] = (tau * var_i * uncertainty_scaler).max(1e-8);
     }
 
     Ok(BlackLittermanViews {
@@ -156,68 +175,59 @@ pub fn build_views_from_pca_alpha(
 // 關鍵功能註解：執行 Black-Litterman 最佳化求解，產出理論目標權重 w_BL
 pub fn run_black_litterman(
     symbols: &[String],
-    garch_cov: &HashMap<String, HashMap<String, f64>>,
+    cov_matrix: &DMatrix<f64>,
     views: &BlackLittermanViews,
     tau: f64,
     risk_aversion: f64,
 ) -> Result<BlackLittermanResult> {
     let n = symbols.len();
-    if n == 0 {
-        return Err(anyhow!("資產列表為空，無法執行 Black-Litterman"));
+    if n == 0 || cov_matrix.nrows() != n {
+        return Err(anyhow!("資產數量不符合或協方差矩陣維度不匹配"));
     }
 
-    let mut cov_arr = Array2::zeros((n, n));
-    for (i, sym_i) in symbols.iter().enumerate() {
-        for (j, sym_j) in symbols.iter().enumerate() {
-            cov_arr[[i, j]] = garch_cov
-                .get(sym_i)
-                .and_then(|row| row.get(sym_j))
-                .cloned()
-                .unwrap_or(0.0);
-        }
-    }
+    // 1. 市場均衡權重 (均等權重假設 w_mkt = 1/N)
+    let w_mkt = DVector::from_element(n, 1.0 / (n as f64));
 
-    let w_mkt = Array1::from_elem(n, 1.0 / (n as f64));
-    let pi = risk_aversion * cov_arr.dot(&w_mkt);
+    // 2. 隱含均衡報酬率 Pi = gamma * Sigma * w_mkt
+    let pi = risk_aversion * (cov_matrix * &w_mkt);
 
-    let cov_inv = symmetric_eigen(&cov_arr)
-        .map(|(vals, vecs)| {
-            let mut inv_diag = Array2::zeros((n, n));
-            for k in 0..n {
-                let val = if vals[k] > 1e-8 { 1.0 / vals[k] } else { 0.0 };
-                inv_diag[[k, k]] = val;
-            }
-            vecs.dot(&inv_diag).dot(&vecs.t())
-        })
-        .unwrap_or_else(|_| Array2::eye(n));
+    // 3. 計算 Sigma 的逆矩陣 (Sigma^-1)
+    let cov_inv = cov_matrix
+        .clone()
+        .try_inverse()
+        .ok_or_else(|| anyhow!("協方差矩陣不可逆，無法執行 BL 求解"))?;
 
-    let mut omega_inv = Array2::zeros((n, n));
+    // 4. 計算 Omega 的逆矩陣 (Omega^-1)
+    let mut omega_inv = DMatrix::zeros(n, n);
     for i in 0..n {
-        let val = views.omega_matrix[[i, i]];
-        omega_inv[[i, i]] = if val > 1e-8 { 1.0 / val } else { 0.0 };
+        let val = views.omega_matrix[(i, i)];
+        omega_inv[(i, i)] = if val > 1e-8 { 1.0 / val } else { 0.0 };
     }
 
+    // 5. BL 核心求解公式:
+    // [(tau * Sigma)^-1 + P^T * Omega^-1 * P]^-1 * [(tau * Sigma)^-1 * Pi + P^T * Omega^-1 * Q]
     let tau_cov_inv = &cov_inv / tau;
-    let middle_inv = &tau_cov_inv + &omega_inv;
+    let p_t = views.p_matrix.transpose();
+    
+    // 中間逆矩陣: M = (tau * Sigma)^-1 + P^T * Omega^-1 * P
+    let middle_mat = &tau_cov_inv + (&p_t * &omega_inv * &views.p_matrix);
+    let middle_inv = middle_mat
+        .try_inverse()
+        .ok_or_else(|| anyhow!("Black-Litterman 中間矩陣不可逆"))?;
 
-    let middle_inv_solved = symmetric_eigen(&middle_inv)
-        .map(|(vals, vecs)| {
-            let mut inv_diag = Array2::zeros((n, n));
-            for k in 0..n {
-                let val = if vals[k] > 1e-8 { 1.0 / vals[k] } else { 0.0 };
-                inv_diag[[k, k]] = val;
-            }
-            vecs.dot(&inv_diag).dot(&vecs.t())
-        })
-        .unwrap_or_else(|_| Array2::eye(n));
+    // 右側向量: R = (tau * Sigma)^-1 * Pi + P^T * Omega^-1 * Q
+    let right_vec = (&tau_cov_inv * &pi) + (&p_t * &omega_inv * &views.q_vector);
 
-    let right_term = tau_cov_inv.dot(&pi) + omega_inv.dot(&views.q_vector);
-    let mu_bl = middle_inv_solved.dot(&right_term);
+    // 後驗期望報酬率 E[R] = M^-1 * R
+    let mu_bl = middle_inv * right_vec;
 
-    let raw_w_bl = (1.0 / risk_aversion) * cov_inv.dot(&mu_bl);
+    // 6. 算出原始未截斷權重 w = (1 / gamma) * Sigma^-1 * mu_bl
+    let raw_w_bl = (1.0 / risk_aversion) * (&cov_inv * &mu_bl);
 
-    let mut clipped_w = raw_w_bl.mapv(|x| x.max(0.0));
+    // 7. 做硬性非負截斷 (Clipping) 與 Re-normalization
+    let mut clipped_w = raw_w_bl.map(|x| x.max(0.0));
     let sum_w: f64 = clipped_w.sum();
+
     if sum_w > 0.0 {
         clipped_w /= sum_w;
     } else {
@@ -866,15 +876,18 @@ pub async fn verify_klines_integrity(
 
     Ok(symbol_stats)
 }
+
 pub fn apply_risk_overlay_and_convert(
     bl_weights: &HashMap<String, f64>,
     tech_features: &HashMap<String, HashMap<String, f64>>,
+    risk_metrics: &BTreeMap<String, RiskMetrics>,
     scale: u32,
     min_weight_threshold: f64,
 ) -> HashMap<String, Decimal> {
     let mut scaled_weights = HashMap::new();
     let mut total_f64_weight = 0.0;
 
+    // 1. 風控疊加 (Risk Overlay) 削減權重
     for (symbol, &w) in bl_weights {
         if w <= 0.0 {
             scaled_weights.insert(symbol.clone(), 0.0);
@@ -882,8 +895,21 @@ pub fn apply_risk_overlay_and_convert(
         }
 
         let mut scale_factor = 1.0;
+
+        // 風控 A：檢查 MDD 硬性門檻 (例如 MDD 跌幅超過 -20% 則強制砍半權重)
+        if let Some(metrics) = risk_metrics.get(symbol) {
+            if metrics.max_drawdown < -0.20 {
+                scale_factor *= 0.5;
+            }
+            // 若 Sharpe 比率小於 0，代表近期風險回報極差，適度降權
+            if metrics.sharpe_ratio < 0.0 {
+                scale_factor *= 0.8;
+            }
+        }
+
+        // 風控 B：技術面特徵輔助 (例如高 ATR 波動度懲罰)
         if let Some(feats) = tech_features.get(symbol) {
-            let atr = feats.get("atr_14").cloned().unwrap_or(0.0);
+            let atr = feats.get("atr_14").copied().unwrap_or(0.0);
             if atr > 0.05 {
                 scale_factor *= 0.8;
             }
@@ -894,14 +920,20 @@ pub fn apply_risk_overlay_and_convert(
         total_f64_weight += final_w;
     }
 
+    // 2. 轉為 Decimal 並進行過濾與歸一化
     let mut decimal_weights = HashMap::new();
     let mut total_decimal_sum = Decimal::ZERO;
     let mut max_symbol: Option<String> = None;
     let mut max_weight = Decimal::ZERO;
 
     for (symbol, &w) in &scaled_weights {
-        let normalized_w = if total_f64_weight > 0.0 { w / total_f64_weight } else { 0.0 };
+        let normalized_w = if total_f64_weight > 0.0 {
+            w / total_f64_weight
+        } else {
+            0.0
+        };
 
+        // 過濾小於最小權重門檻的雜訊 (Dust Trades)
         if normalized_w < min_weight_threshold {
             decimal_weights.insert(symbol.clone(), Decimal::ZERO);
             continue;
@@ -920,25 +952,101 @@ pub fn apply_risk_overlay_and_convert(
         }
     }
 
+    // 3. 處理微小四捨五入餘數 (Rounding Difference) 補正
     let target_sum = Decimal::ONE;
     if total_decimal_sum > Decimal::ZERO && total_decimal_sum != target_sum {
         let diff = target_sum - total_decimal_sum;
+        // 將微小的精度差值加在最大持倉標的上，確保加總無縫等於 1.0
         if let Some(symbol) = max_symbol {
             if let Some(w) = decimal_weights.get_mut(&symbol) {
                 *w += diff;
             }
         }
+    } else if total_decimal_sum == Decimal::ZERO {
+        // 安全防線：若極端狀況下全被切成 0，則轉為全持現金 (或防禦狀態)
+        // 此處預留：不觸發 Panic 崩潰，維持系統穩定執行
     }
-    let final_sum: Decimal = decimal_weights.values().sum();
-    assert_eq!(
-        final_sum,
-        Decimal::ONE,
-        "權重總和校正失敗，當前總和為: {}",
-        final_sum
-    );
+
     decimal_weights
 }
+pub fn compute_risk_metrics(
+    data: &DailyLogReturns,
+    annual_factor: f64,
+    risk_free_input:RiskFreeInput,
+) -> Result<BTreeMap<String, RiskMetrics>> {
+    let mut metrics_map = BTreeMap::new();
+    let risk_free_rate =match risk_free_input{
+        RiskFreeInput::Fixed=>RISK_FREE_RATE, // 可依需求調整或作為參數傳入
+        RiskFreeInput::TimeSeries=>todo!(), //之後有存時間序列risk_free_rate的時候可以用
+    };
+    for (symbol, series) in &data.returns {
+        // 1. 過濾掉 Option::None，留下有效的 Log Return 數據
+        let valid_returns: Vec<f64> = series.iter().filter_map(|&r| r).collect();
 
+        if valid_returns.is_empty() {
+            continue;
+        }
+
+        let n = valid_returns.len() as f64;
+
+        // 2. 計算平均 Return 與標準差 (Volatility)
+        let mean_return = valid_returns.iter().sum::<f64>() / n;
+        
+        let variance = if n > 1.0 {
+            valid_returns
+                .iter()
+                .map(|r| (r - mean_return).powi(2))
+                .sum::<f64>() / (n - 1.0)
+        } else {
+            0.0
+        };
+        let std_dev = variance.sqrt();
+
+        // 3. 年化指標計算
+        let ann_return = mean_return * annual_factor;
+        let ann_vol = std_dev * annual_factor.sqrt();
+
+        // 4. 年化 Sharpe Ratio
+        let sharpe = if ann_vol > 1e-8 {
+            (ann_return - risk_free_rate) / ann_vol
+        } else {
+            0.0
+        };
+
+        // 5. 計算 Maximum Drawdown (MDD)
+        // 透過 Log Return 的累積和 (Cumulative Sum) 算出的權益曲線 (Equity Curve)
+        let mut peak = 0.0f64; // ln(1.0) = 0.0
+        let mut cum_return = 0.0f64;
+        let mut max_drawdown = 0.0f64;
+
+        for &r in &valid_returns {
+            cum_return += r;
+            if cum_return > peak {
+                peak = cum_return;
+            }
+            // 當前相對高峰的跌幅 (Log Return 視角)
+            let drawdown = cum_return - peak; 
+            if drawdown < max_drawdown {
+                max_drawdown = drawdown;
+            }
+        }
+
+        // 將對數跌幅轉回實際百分比跌幅: exp(mdd) - 1.0
+        let real_mdd = max_drawdown.exp() - 1.0;
+
+        metrics_map.insert(
+            symbol.clone(),
+            RiskMetrics {
+                sharpe_ratio: sharpe,
+                max_drawdown: real_mdd,
+                annualized_volatility: ann_vol,
+                annualized_return: ann_return,
+            },
+        );
+    }
+
+    Ok(metrics_map)
+}
 pub async fn run_analysis(
     client: &reqwest::Client,
     db: &MarketDatabase,
@@ -948,7 +1056,7 @@ pub async fn run_analysis(
 ) -> anyhow::Result<AnalysisResult> {
     let end_ts = config.as_of_ts.unwrap_or_else(|| Utc::now().timestamp());
     let start_iso_str = config.start_iso.as_deref();
-    
+
     let start_ts = match start_iso_str {
         Some(iso) => DateTime::parse_from_rfc3339(iso)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
@@ -956,7 +1064,7 @@ pub async fn run_analysis(
         None => 946684800,
     };
 
-    // 階段 1：補資料與資料對齊
+    // 階段 1：數據補齊與對齊
     SelectionPipeline::backfill_portfolio_klines(client, db, start_iso_str, &config.timeframe).await.map_err(|e| anyhow::anyhow!(e.to_string()))?; 
     info!("資料補齊完成");
 
@@ -972,10 +1080,14 @@ pub async fn run_analysis(
         raw_klines_map.insert(target.symbol.clone(), klines);
     }
 
-    // 階段 2 初步計算歷史對數日報酬率與共變異數矩陣
+    // 階段 2：基礎對數報酬率、標準共變異數與風控指標計算
     let aligned_data = align_and_forward_fill(&raw_klines_map);
-    let daily_log_returns = compute_daily_log_returns(&aligned_data);
-    let base_stats = compute_base_statistics(&daily_log_returns);
+    let daily_log_returns: DailyLogReturns = compute_daily_log_returns(&aligned_data);
+    let base_stats: BaseStatistics = compute_base_statistics(&daily_log_returns);
+
+    // 關鍵功能註解：計算統計與風控指標(Sharpe/MDD)，作為後續硬性風控過濾依據
+    let risk_metrics: BTreeMap<String, RiskMetrics> = compute_risk_metrics(&daily_log_returns, 252.0,RiskFreeInput::Fixed)
+        .with_context(|| "計算 Sharpe 與 MDD 風控指標失敗")?;
 
     // 關鍵功能註解：將同步檔案 IO 隔離在獨立作用域，避免 std::io::Error 殘留跨越後續 await
     {
@@ -984,30 +1096,31 @@ pub async fn run_analysis(
         serde_json::to_writer_pretty(writer, &daily_log_returns).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
 
-    // 階段 3：實時特徵工程與動態模型
+    // 階段 3：實時特徵工程與 PCA 結構分解 (已移除 GARCH)
     let tech_features: HashMap<String, HashMap<String, f64>> = compute_pure_price_features(&aligned_data, end_ts)
         .with_context(|| format!("執行 run_analysis 階段 3 失敗 [end_ts: {}, timeframe: {:?}]", end_ts, config.timeframe))?;
 
-    let latent_factor_analysis = compute_cross_sectional_pca(&daily_log_returns, 3)
+    let latent_factor_analysis: LatentFactorResult = compute_cross_sectional_pca(&daily_log_returns, 3)
         .with_context(|| "執行 run_analysis 階段 3.2 PCA 隱性因子分解失敗")?;
 
-    let garch_cov_matrix = compute_factor_garch_cov(&daily_log_returns, &latent_factor_analysis, 3)
-        .with_context(|| "執行 run_analysis 階段 3.3 GARCH時序與動態模型失敗")?;
-
-    // 階段 4：理論投資組合建構
+    // 階段 4：Black-Litterman 權重優化與硬性風控門檻
     let symbols: Vec<String> = daily_log_returns.returns.keys().cloned().collect();
+    //這兩個最好改config
     let tau = 0.025;
     let risk_aversion = 2.5;
 
-    let bl_views = build_views_from_pca_alpha(&latent_factor_analysis, &tech_features, &symbols, &garch_cov_matrix, tau)
+    // 關鍵功能註解：改用標準歷史共變異數矩陣 base_stats.cov_matrix 代替 GARCH 矩陣
+    let bl_views = build_views_from_pca_alpha(&latent_factor_analysis, &tech_features, &symbols, &base_stats.covariance_matrix, tau)
         .with_context(|| "執行 run_analysis 階段 4.1 構建 BL 觀點矩陣失敗")?;
 
-    let bl_result = run_black_litterman(&symbols, &garch_cov_matrix, &bl_views, tau, risk_aversion)
+    let bl_result = run_black_litterman(&symbols, &base_stats.covariance_matrix, &bl_views, tau, risk_aversion)
         .with_context(|| "執行 run_analysis 階段 4.2 Black-Litterman 求解失敗")?;
 
+    // 關鍵功能註解：引入 risk_metrics 進行硬性風控裁切，如 MDD 過高則限制持倉
     let target_decimal_weights: HashMap<String, Decimal> = apply_risk_overlay_and_convert(
         &bl_result.target_weights,
         &tech_features,
+        &risk_metrics,
         8,
         0.0001,
     );
@@ -1016,7 +1129,7 @@ pub async fn run_analysis(
         db.save_portfolio_weights(&target_decimal_weights).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         info!("[DB] 成功存入當日開盤基準權重與分析數據");
     }
-    
+
     Ok(AnalysisResult {
         start_ts,
         end_ts,
