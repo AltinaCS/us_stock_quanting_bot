@@ -2,10 +2,10 @@
 
 > **⚠️ 免責聲明 **
 > 
-> 本專案僅供**自我學習**與教育參考，不構成任何投資建議。金融市場交易風險極高，使用者須自負盈虧，開發者不負擔任何法律與財務責任。
+> 本專案目前僅於**模擬盤（Paper Trading）**環境進行測試，**尚未進行實盤交易**。本專案僅供自我學習與教育參考，不構成任何投資建議。金融市場交易風險極高，使用者須自負盈虧，開發者不負擔任何法律與財務責任。
 >
->  **⚠️ Disclaimer **
-> This project is for **self-learning** and educational purposes only and does not constitute financial advice. Trading involves substantial risk; users assume full responsibility for their own results, and the developer(s) assume no liability whatsoever.
+> **⚠️ Disclaimer **
+> This project is currently in **paper trading** status for self-learning and educational purposes only and does not constitute financial advice. Trading involves substantial risk; users assume full responsibility for their own results, and the developer(s) assume no liability whatsoever.
 
 ---
 
